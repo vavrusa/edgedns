@@ -1,4 +1,4 @@
-use hooks::{Director, SessionState};
+use crate::hooks::{Director, SessionState};
 use libc::{c_char, c_int, c_void, size_t};
 use nix::sys::socket::{self, sockaddr_storage};
 use std::cell::RefCell;

@@ -1,10 +1,11 @@
 //! Send authoritative data received from upstream servers to a dnstap socket
 
 use coarsetime::Clock;
-use config::Config;
+use crate::config::Config;
 use dnstap::{self, DNSMessage, DNSTapBuilder, DNSTapPendingWriter, DNSTapWriter, MessageType,
              SocketProtocol};
 use std::net::SocketAddr;
+use log::info;
 
 pub struct LogDNSTap {
     dnstap_pending_writer: Option<DNSTapPendingWriter>,

@@ -18,15 +18,16 @@
 
 use clockpro_cache::*;
 use coarsetime::{Duration, Instant};
-use config::Config;
-use dns;
-use dns::{LocalUpstreamQuestion, NormalizedQuestion, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
+use crate::config::Config;
+use crate::dns;
+use crate::dns::{LocalUpstreamQuestion, NormalizedQuestion, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
 use dnssector::ParsedPacket;
-use errors::*;
+use crate::errors::*;
 use failure;
 use parking_lot::Mutex;
 use std::ops::Sub;
 use std::sync::Arc;
+use log::debug;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct CacheKey {
@@ -87,7 +88,7 @@ impl CacheKey {
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
     pub expiration: Instant,
-    pub packet: Vec<u8>,
+    pub packet: Arc<Vec<u8>>,
 }
 
 impl CacheEntry {
@@ -154,14 +155,29 @@ impl Cache {
         let now = Instant::recent();
         let duration = Duration::from_secs(u64::from(ttl));
         let expiration = now + duration;
-        let cache_entry = CacheEntry { expiration, packet };
+        let cache_entry = CacheEntry { expiration, packet: Arc::new(packet) };
         let mut cache = self.arc_mx.lock();
         cache.insert(cache_key, cache_entry)
     }
 
     pub fn get(&mut self, cache_key: &CacheKey) -> Option<CacheEntry> {
         let mut cache = self.arc_mx.lock();
-        cache.get_mut(cache_key).and_then(|res| Some(res.clone()))
+        cache.get_mut(cache_key).and_then(|cache_entry| {
+            if self.config.decrement_ttl {
+                let now = Instant::recent();
+                if now <= cache_entry.expiration {
+                    let remaining_ttl = cache_entry.expiration.duration_since(now).as_secs();
+                    let packet = Arc::get_mut(&mut cache_entry.packet);
+                    match packet {
+                    Some(mutable) => {
+                        let _ = dns::set_ttl(mutable, remaining_ttl as u32);
+                    },
+                    None => {}
+                    }
+                }
+            }
+            Some(cache_entry.clone())
+        })
     }
 
     /// get2() does a couple things before checking that a key is present in the cache.
@@ -178,14 +194,7 @@ impl Cache {
     /// This might be revisited later.
     pub fn get2(&mut self, cache_key: &CacheKey) -> Option<CacheEntry> {
         let cache_entry = self.get(cache_key);
-        if let Some(mut cache_entry) = cache_entry {
-            if self.config.decrement_ttl {
-                let now = Instant::recent();
-                if now <= cache_entry.expiration {
-                    let remaining_ttl = cache_entry.expiration.duration_since(now).as_secs();
-                    let _ = dns::set_ttl(&mut cache_entry.packet, remaining_ttl as u32);
-                }
-            }
+        if let Some(cache_entry) = cache_entry {
             return Some(cache_entry);
         }
         if !cache_key.local_upstream_question.dnssec {
@@ -214,11 +223,11 @@ impl Cache {
                         let local_upstream_question = &cache_key.local_upstream_question;
                         return Some(CacheEntry {
                             expiration: shifted_cache_entry.expiration,
-                            packet: dns::build_nxdomain_packet(
+                            packet: Arc::new(dns::build_nxdomain_packet(
                                 &local_upstream_question.qname_lc,
                                 local_upstream_question.qtype,
                                 local_upstream_question.qclass,
-                            ).unwrap(),
+                            ).unwrap()),
                         });
                     }
                 }

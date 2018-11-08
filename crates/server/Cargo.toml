@@ -1,0 +1,31 @@
+[package]
+name = "edgedns"
+version = "0.4.0"
+authors = ["Frank Denis <github@pureftpd.org>", "Marek Vavrusa <marek@vavrusa.com>"]
+publish = false
+edition = "2018"
+
+[features]
+jemalloc = ["jemallocator"]
+webservice = ["hyper"]
+default = ["jemalloc"]
+
+[[bin]]
+name = "edgedns"
+path = "src/main.rs"
+
+[dependencies]
+log = "*"
+clap = "*"
+socket2 = {version = "*", features = ["reuseport"]}
+env_logger = "^0.6"
+bytes = "*"
+futures = "*"
+clippy = {version = "*", optional = true}
+tokio = {git = "https://github.com/tokio-rs/tokio", features=["async-await-preview"]}
+libedgedns = {version = "0.4.0", path = "../libedgedns"}
+jemallocator = {version = "*", optional = true}
+hyper = {version = "0.12", optional = true}
+mime = "*"
+coarsetime = "*"
+prometheus = "*"

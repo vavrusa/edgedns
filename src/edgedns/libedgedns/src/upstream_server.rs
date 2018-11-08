@@ -8,12 +8,13 @@
 use super::{UPSTREAM_QUERY_MAX_DEVIATION_COEFFICIENT, UPSTREAM_QUERY_MAX_TIMEOUT_MS,
             UPSTREAM_QUERY_MIN_TIMEOUT_MS};
 use coarsetime::{Duration, Instant};
-use config::Config;
+use crate::config::Config;
 use std::net::{self, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio_core::reactor::Handle;
-use varz::Varz;
+use tokio::prelude::*;
+use log::{debug, info, warn};
+use crate::varz::Varz;
 
 const RTT_DECAY: f64 = 0.125;
 const RTT_DEV_DECAY: f64 = 0.25;
@@ -98,7 +99,6 @@ impl UpstreamServer {
     pub fn record_failure(
         &mut self,
         config: &Config,
-        handle: &Handle,
         ext_net_udp_sockets_rc: &Rc<Vec<net::UdpSocket>>,
     ) {
         if self.offline {

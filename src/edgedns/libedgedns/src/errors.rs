@@ -2,6 +2,8 @@ use failure::Error;
 use failure::Fail;
 use failure::ResultExt;
 use std::io;
+use tokio::prelude::*;
+use tokio::timer::{Timeout, Error as TimerError};
 
 #[derive(Debug, Fail)]
 pub enum DNSError {
@@ -27,6 +29,8 @@ pub enum DNSError {
     SpuriousResponse,
     #[fail(display = "timeout")]
     Timeout,
+    #[fail(display = "timer error")]
+    TimerError,
     #[fail(display = "too busy")]
     TooBusy,
     #[fail(display = "refused")]

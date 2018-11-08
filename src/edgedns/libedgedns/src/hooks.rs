@@ -1,7 +1,7 @@
 //! Pre/post cache/request hooks
 
-use c_abi;
-use client_query::ClientQuery;
+use crate::c_abi;
+use crate::client_query::ClientQuery;
 use dnssector::{self, DNSSector, ParsedPacket};
 use glob::glob;
 use libloading::{self, Library};
@@ -19,7 +19,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
-use upstream_server::UpstreamServerForQuery;
+use crate::upstream_server::UpstreamServerForQuery;
+use log::{debug, info, warn, error};
 
 const MASTER_SERVICE_LIBRARY_NAME: &str = "master";
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -303,10 +304,10 @@ impl Hooks {
     #[inline]
     pub fn enabled(&self, _stage: Stage) -> bool {
         let service = self.services.get(&self.master_service_id);
-        service
-            .expect("Nonexistent service")
-            .service_hooks
-            .is_some()
+        match service {
+            Some(x) => x.service_hooks.is_some(),
+            None => false,
+        }
     }
 
     fn apply_clientside_for_service(

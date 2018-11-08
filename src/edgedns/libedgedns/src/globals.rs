@@ -1,14 +1,14 @@
-use cache::Cache;
-use client_query::ClientQuery;
-use config::Config;
+use crate::cache::Cache;
+use crate::client_query::ClientQuery;
+use crate::config::Config;
 use futures::sync::mpsc::Sender;
-use hooks::Hooks;
+use crate::hooks::Hooks;
 use parking_lot::RwLock;
-use resolver_queries_handler::PendingQueries;
+use crate::resolver_queries_handler::PendingQueries;
 use std::collections::HashMap;
 use std::sync::Arc;
-use upstream_server::UpstreamServerForQuery;
-use varz::Varz;
+use crate::upstream_server::UpstreamServerForQuery;
+use crate::varz::Varz;
 
 #[derive(Clone)]
 pub struct Globals {

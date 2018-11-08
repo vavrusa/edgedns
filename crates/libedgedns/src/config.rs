@@ -4,14 +4,16 @@
 //! server.
 
 use coarsetime::Duration;
-use crate::resolver::LoadBalancingMode;
 use std::fs::File;
-use std::io::{Error, ErrorKind};
 use std::io::prelude::*;
+use std::io::{Error, ErrorKind};
 use std::path::Path;
 use toml;
+use crate::forwarder::LoadBalancingMode;
 
-#[derive(Clone, Debug)]
+
+
+#[derive(Clone, Debug, Default)]
 pub struct Config {
     pub decrement_ttl: bool,
     pub upstream_servers_str: Vec<String>,
@@ -57,7 +59,7 @@ impl Config {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     "Syntax error - config file is not valid TOML",
-                ))
+                ));
             }
         };
         Self::parse(&toml_config)
@@ -78,7 +80,7 @@ impl Config {
                     ErrorKind::InvalidData,
                     "Invalid value for the type of upstream servers. Must be \
                      'authoritative or 'resolver'",
-                ))
+                ));
             }
         };
 
@@ -102,22 +104,24 @@ impl Config {
             });
         let lbmode = match lbmode_str {
             "uniform" => LoadBalancingMode::Uniform,
-            "fallback" => LoadBalancingMode::Fallback,
-            "minload" => LoadBalancingMode::P2,
+            "consistent" => LoadBalancingMode::Consistent,
+            // "minload" => LoadBalancingMode::MinLoad,
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     "Invalid value for the load balancing/failover strategy",
-                ))
+                ));
             }
         };
 
-        let upstream_max_failure_duration = Duration::from_millis(config_upstream
-            .and_then(|x| x.get("max_failure_duration"))
-            .map_or(2500, |x| {
-                x.as_integer()
-                    .expect("upstream.max_failure_duration must be an integer")
-            }) as u64);
+        let upstream_max_failure_duration = Duration::from_millis(
+            config_upstream
+                .and_then(|x| x.get("max_failure_duration"))
+                .map_or(2500, |x| {
+                    x.as_integer()
+                        .expect("upstream.max_failure_duration must be an integer")
+                }) as u64,
+        );
 
         let config_cache = toml_config.get("cache");
 
@@ -200,13 +204,13 @@ impl Config {
                     .expect("global.threads_tcp must be an integer")
             }) as usize;
 
-        let max_tcp_clients = config_global.and_then(|x| x.get("max_tcp_clients")).map_or(
-            250,
-            |x| {
-                x.as_integer()
-                    .expect("global.max_tcp_clients must be an integer")
-            },
-        ) as usize;
+        let max_tcp_clients =
+            config_global
+                .and_then(|x| x.get("max_tcp_clients"))
+                .map_or(250, |x| {
+                    x.as_integer()
+                        .expect("global.max_tcp_clients must be an integer")
+                }) as usize;
 
         let max_waiting_clients = config_global
             .and_then(|x| x.get("max_waiting_clients"))

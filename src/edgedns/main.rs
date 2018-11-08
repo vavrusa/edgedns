@@ -1,14 +1,9 @@
 //! Import all the required crates, instanciate the main components and start
 //! the service.
-#![feature(conservative_impl_trait, universal_impl_trait, nll)]
 #![allow(dead_code, unused_imports, unused_variables)]
 
-extern crate clap;
-extern crate env_logger;
-extern crate libedgedns;
-#[macro_use]
-extern crate log;
-
+use env_logger;
+use log::{info, debug, error};
 use clap::{App, Arg};
 use libedgedns::{Config, EdgeDNS};
 

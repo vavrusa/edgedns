@@ -1,17 +1,20 @@
 //! Expose metrics via the Prometheus API
 
-use futures::future::{self, FutureResult};
-use hyper;
-use hyper::{StatusCode, Uri};
-use hyper::header::{ContentLength, ContentType};
-use hyper::mime::Mime;
-use hyper::server::{Http, Request, Response, Server, Service};
+use futures::future;
+use futures::prelude::*;
+use tokio::runtime::Runtime;
+use tokio::net::TcpListener;
+use hyper::server::conn::Http;
+use hyper::service::Service;
+use hyper::{Body, Method, Request, Response, StatusCode};
+use mime::Mime;
 use prometheus::{self, Encoder, TextEncoder};
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use varz::{StartInstant, Varz};
+use log::info;
+use crate::varz::{StartInstant, Varz};
 
 use super::EdgeDNSContext;
 
@@ -21,14 +24,18 @@ pub struct WebService {
 }
 
 impl Service for WebService {
-    type Request = Request;
-    type Response = Response;
+    type ReqBody = Body;
+    type ResBody = Body;
     type Error = hyper::Error;
-    type Future = FutureResult<Response, hyper::Error>;
+    type Future = Box<Future<Item = Response<Body>, Error = Self::Error> + Send>;
 
-    fn call(&self, req: Request) -> Self::Future {
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
         if req.uri().path() != "/metrics" {
-            return future::ok(Response::new().with_status(StatusCode::NotFound));
+            let response = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+            return Box::new(future::ok(response));
         }
         let StartInstant(start_instant) = self.varz.start_instant;
         let uptime = start_instant.elapsed().as_secs();
@@ -40,12 +47,13 @@ impl Service for WebService {
         let mut buffer = vec![];
         let encoder = TextEncoder::new();
         encoder.encode(&metric_families, &mut buffer).unwrap();
-        future::ok(
-            Response::new()
-                .with_header(ContentLength(buffer.len() as u64))
-                .with_header(ContentType(encoder.format_type().parse::<Mime>().unwrap()))
-                .with_body(buffer),
-        )
+        Box::new(future::ok(
+            Response::builder()
+                .header(hyper::header::CONTENT_LENGTH, buffer.len() as u64)
+                .header(hyper::header::CONTENT_TYPE, encoder.format_type())
+                .body(Body::from(buffer))
+                .unwrap(),
+        ))
     }
 }
 
@@ -59,25 +67,27 @@ impl WebService {
     pub fn spawn(
         edgedns_context: &EdgeDNSContext,
         service_ready_tx: mpsc::SyncSender<u8>,
-    ) -> io::Result<thread::JoinHandle<()>> {
+        rt: &mut Runtime,
+    ) {
         let listen_addr = edgedns_context
             .config
             .webservice_listen_addr
             .parse()
             .expect("Unsupport listen address for the prometheus service");
-        let web_service = WebService::new(edgedns_context);
-        let webservice_th = thread::Builder::new()
-            .name("webservice".to_string())
-            .spawn(move || {
-                let server = Http::new()
-                    .keep_alive(false)
-                    .bind(&listen_addr, move || Ok(web_service.clone()))
-                    .expect("Unable to spawn the webservice");
-                service_ready_tx.send(2).unwrap();
-                info!("Webservice started on {}", listen_addr);
-                server.run().expect("Unable to start the webservice");
-            })
-            .unwrap();
-        Ok(webservice_th)
+
+        let service = WebService::new(edgedns_context);
+        let listener = TcpListener::bind(&listen_addr).unwrap();
+        let mut http = Http::new();
+        http.keep_alive(false);
+        let server = listener.incoming().for_each(move |io| {
+                let conn = http.serve_connection(io, service.clone()).map_err(|_| {});
+                tokio::spawn(conn);
+                Ok(())
+        });
+
+        rt.spawn(server.map_err(|_| {}));
+        service_ready_tx.send(2).unwrap();
+
+        info!("Webservice started on {}", listen_addr);
     }
 }

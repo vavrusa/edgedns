@@ -1,16 +1,19 @@
 use futures::{Future, Stream};
-use hooks::Hooks;
+use crate::hooks::Hooks;
 use parking_lot::RwLock;
-use prost::Message;
+use prost;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
 use std::thread;
-use tokio_core::reactor::{Core, Handle};
-use tokio_io::io::{read_to_end, write_all};
-use tokio_uds::{UnixListener, UnixStream};
+use tokio::prelude::*;
+use tokio::runtime::Runtime;
+use tokio::io::{read_to_end, write_all};
+use tokio::net::{UnixListener, UnixStream};
+use prost::*;
+#[macro_use] use prost_derive::*;
 
 pub mod cli {
     include!(concat!(env!("OUT_DIR"), "/edgedns.cli.rs"));
@@ -54,7 +57,7 @@ impl CLIListener {
         }
     }
 
-    fn client_process(&self, socket: UnixStream, handle: &Handle) {
+    fn client_process(&self, socket: UnixStream) {
         let hooks_arc = Arc::clone(&self.hooks_arc);
         let buf = Vec::new();
         let reader = read_to_end(socket, buf)
@@ -70,30 +73,29 @@ impl CLIListener {
                 Ok(())
             })
             .then(|_| Ok(()));
-        handle.spawn(reader)
+
+        tokio::spawn(reader);
     }
 
-    pub fn spawn(self) {
-        let cli_listener_th = thread::Builder::new()
-            .name("cli_listener".to_string())
-            .spawn(move || {
-                let mut event_loop = Core::new().unwrap();
-                let handle = event_loop.handle();
-                let listener = match UnixListener::bind(&self.socket_path, &handle) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let _ = fs::remove_file(&self.socket_path);
-                        UnixListener::bind(&self.socket_path, &handle).expect(&format!(
-                            "Unable to create a unix socket named [{}]",
-                            self.socket_path
-                        ))
-                    }
-                };
-                let task = listener.incoming().for_each(|(socket, _client_addr)| {
-                    self.client_process(socket, &handle);
-                    Ok(())
-                });
-                event_loop.run(task).unwrap();
-            });
+    pub fn spawn(self, rt: &mut Runtime) {
+        let listener = match UnixListener::bind(&self.socket_path) {
+            Ok(m) => m,
+            Err(_) => {
+                let _ = fs::remove_file(&self.socket_path);
+                UnixListener::bind(&self.socket_path).expect(&format!(
+                    "Unable to create a unix socket named [{}]",
+                    self.socket_path
+                ))
+            }
+        };
+
+        let task = listener.incoming()
+        .map_err(|e| eprintln!("accept failed = {:?}", e))
+        .for_each(move |socket| {
+            self.client_process(socket);
+            Ok(())
+        });
+
+        rt.spawn(task);
     }
 }

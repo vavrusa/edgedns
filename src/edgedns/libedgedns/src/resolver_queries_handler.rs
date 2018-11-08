@@ -9,25 +9,24 @@
 
 use super::{DEFAULT_GRACE_SEC, FAILURE_TTL, UPSTREAM_PROBES_DELAY_MS,
             UPSTREAM_QUERY_MAX_TIMEOUT_MS};
-use cache::Cache;
-use cache::CacheKey;
-use client_query::{ClientQuery, ResolverResponse};
+use crate::cache::{Cache, CacheKey};
+use crate::client_query::{ClientQuery, ResolverResponse};
 use coarsetime::{Duration, Instant};
-use config::Config;
-use dns;
-use dns::*;
-use errors::*;
+use crate::config::Config;
+use crate::dns;
+use crate::dns::*;
+use crate::errors::*;
 use futures::Future;
 use futures::Stream;
 use futures::future;
 use futures::sync::mpsc::Receiver;
 use futures::sync::oneshot;
-use globals::Globals;
+use crate::globals::Globals;
 use jumphash::JumpHasher;
 use parking_lot::{Mutex, RwLock};
-use rand;
-use rand::distributions::{IndependentSample, Range};
-use resolver::{LoadBalancingMode, ResolverCore};
+use rand::prelude::*;
+use rand::distributions::{Distribution, Uniform};
+use crate::resolver::{LoadBalancingMode, ResolverCore};
 use std::collections::HashMap;
 use std::io;
 use std::net;
@@ -37,10 +36,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time;
-use tokio_core::reactor::Handle;
-use tokio_timer::{wheel, Timer};
-use upstream_server::{UpstreamServer, UpstreamServerForQuery};
-use varz::Varz;
+use tokio::prelude::*;
+use tokio::timer::{Timeout};
+use crate::upstream_server::{UpstreamServer, UpstreamServerForQuery};
+use crate::varz::Varz;
+use log::{debug, info};
 
 #[derive(Default)]
 pub struct WaitingClients {
@@ -61,54 +61,40 @@ pub struct PendingQueries {
 
 pub struct ResolverQueriesHandler {
     globals: Globals,
-    handle: Handle,
-    net_udp_socket: net::UdpSocket,
-    net_ext_udp_sockets_rc: Rc<Vec<net::UdpSocket>>,
+    net_ext_udp_sockets_rc: Arc<Vec<net::UdpSocket>>,
     jumphasher: JumpHasher,
-    timer: Timer,
 }
 
 impl Clone for ResolverQueriesHandler {
     fn clone(&self) -> Self {
         ResolverQueriesHandler {
             globals: self.globals.clone(),
-            handle: self.handle.clone(),
-            net_udp_socket: self.net_udp_socket.try_clone().unwrap(),
-            net_ext_udp_sockets_rc: Rc::clone(&self.net_ext_udp_sockets_rc),
+            net_ext_udp_sockets_rc: Arc::clone(&self.net_ext_udp_sockets_rc),
             jumphasher: self.jumphasher,
-            timer: self.timer.clone(),
         }
     }
 }
 
 impl ResolverQueriesHandler {
     pub fn new(resolver_core: &ResolverCore) -> Self {
-        let timer = wheel()
-            .max_capacity(resolver_core.globals.config.max_active_queries)
-            .build();
         ResolverQueriesHandler {
             globals: resolver_core.globals.clone(),
-            handle: resolver_core.handle.clone(),
-            net_udp_socket: resolver_core.net_udp_socket.try_clone().unwrap(),
-            net_ext_udp_sockets_rc: Rc::clone(&resolver_core.net_ext_udp_sockets_rc),
+            net_ext_udp_sockets_rc: Arc::clone(&resolver_core.net_ext_udp_sockets_rc),
             jumphasher: resolver_core.jumphasher,
-            timer,
         }
     }
 
     pub fn fut_process_stream(
         &self,
-        handle: &Handle,
         resolver_rx: Receiver<ClientQuery>,
     ) -> impl Future {
-        let handle = handle.clone();
         let mut self_inner = self.clone();
         let fut_client_query = resolver_rx.for_each(move |client_query| {
             let fut = self_inner
                 .fut_process_client_query(client_query)
                 .map_err(|_| {});
-            handle.spawn(fut);
-            future::ok(())
+            tokio::spawn(fut);
+            Ok(())
         });
         fut_client_query.map_err(|_| io::Error::last_os_error())
     }
@@ -119,16 +105,15 @@ impl ResolverQueriesHandler {
     ) -> impl Future<Item = (), Error = DNSError> {
         debug!("Incoming client query");
 
-        let normalized_question = &client_query.normalized_question;
         let (custom_hash, bypass_cache) = {
             let session_state = client_query.session_state.as_ref().unwrap().inner.read();
             (session_state.custom_hash, session_state.bypass_cache)
         };
         let local_upstream_question = LocalUpstreamQuestion {
-            qname_lc: normalized_question.qname_lc.clone(), // XXX - maybe make qname_lc a Rc
-            qtype: normalized_question.qtype,
-            qclass: normalized_question.qclass,
-            dnssec: normalized_question.dnssec,
+            qname_lc: client_query.normalized_question.qname_lc.clone(), // XXX - maybe make qname_lc a Rc
+            qtype: client_query.normalized_question.qtype,
+            qclass: client_query.normalized_question.qclass,
+            dnssec: client_query.normalized_question.dnssec,
             custom_hash,
             bypass_cache,
         };
@@ -139,7 +124,7 @@ impl ResolverQueriesHandler {
             .cloned();
         if let Some(upstream_question) = upstream_question {
             debug!("Already in-flight");
-            let mut waiting_clients = pending_queries_inner
+            let waiting_clients = pending_queries_inner
                 .waiting_clients
                 .get_mut(&upstream_question)
                 .expect("No waiting clients, but existing local question");
@@ -153,11 +138,9 @@ impl ResolverQueriesHandler {
         };
         {
             let session_state = &mut client_query.session_state.as_mut().unwrap().inner.write();
-            let director = &session_state.director;
-            let upstream_servers_socket_addrs = &director.upstream_servers_socket_addrs;
-            if !upstream_servers_socket_addrs.is_empty() {
+            if !session_state.director.upstream_servers_socket_addrs.is_empty() {
                 let upstream_servers_for_query: Vec<UpstreamServerForQuery> =
-                    upstream_servers_socket_addrs
+                    session_state.director.upstream_servers_socket_addrs
                         .iter()
                         .map(|&remote_addr| remote_addr.into())
                         .collect();
@@ -184,7 +167,7 @@ impl ResolverQueriesHandler {
         };
         let net_ext_udp_sockets = &self.net_ext_udp_sockets_rc;
         let mut rng = rand::thread_rng();
-        let random_ext_socket_i = Range::new(0, net_ext_udp_sockets.len()).ind_sample(&mut rng);
+        let random_ext_socket_i = Uniform::new(0, net_ext_udp_sockets.len()).sample(&mut rng);
         let net_ext_udp_socket = &net_ext_udp_sockets[random_ext_socket_i];
         if let Err(e) = net_ext_udp_socket.send_to(&packet, remote_addr) {
             return future::err(DNSError::Io(e));
@@ -230,12 +213,12 @@ impl ResolverQueriesHandler {
             .map_err(|_| {})
             .and_then(move |upstream_packet| {
                 let response_base = ResolverResponse {
-                    packet: upstream_packet,
+                    packet: Arc::new(upstream_packet),
                     dnssec: false,
                     session_state: None,
                 };
                 let mut waiting_clients = waiting_clients.lock();
-                for mut client_query in &mut waiting_clients.client_queries {
+                for client_query in &mut waiting_clients.client_queries {
                     let mut response = response_base.clone();
                     response.session_state = client_query.session_state.take();
                     let _ = client_query.response_tx.take().unwrap().send(response);
@@ -259,7 +242,7 @@ impl ResolverQueriesHandler {
                             let cache_key = CacheKey::from_local_upstream_question(
                                 local_upstream_question_inner,
                             );
-                            cache_inner.insert(cache_key, response_base.packet, ttl);
+                            cache_inner.insert(cache_key, response_base.packet.to_vec(), ttl);
                         }
                         _ => {}
                     }
@@ -269,9 +252,8 @@ impl ResolverQueriesHandler {
 
         let mut pending_queries = self.globals.pending_queries.clone();
         let globals = self.globals.clone();
-        let fut_timeout = self.timer
+        let fut_timeout = Box::new(fut)
             .timeout(
-                fut,
                 time::Duration::from_millis(UPSTREAM_QUERY_MAX_TIMEOUT_MS),
             )
             .map_err(move |_| {
@@ -285,7 +267,7 @@ impl ResolverQueriesHandler {
                 }
             });
 
-        self.handle.spawn(fut_timeout);
+        tokio::spawn(fut_timeout);
         future::ok(())
     }
 }
@@ -327,13 +309,13 @@ impl FailureHandler {
             Ok(servfail_packet) => servfail_packet,
         };
         let servfail_response = ResolverResponse {
-            packet: servfail_packet,
+            packet: Arc::new(servfail_packet),
             dnssec: false,
             session_state: None,
         };
         let mut waiting_clients = waiting_clients.lock();
         let client_queries = &mut waiting_clients.client_queries;
-        for mut client_query in client_queries {
+        for client_query in client_queries {
             let response =
                 Self::get_stale_or_default_response(&globals, client_query, &servfail_response);
             let _ = client_query.response_tx.take().unwrap().send(response);

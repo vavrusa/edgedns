@@ -4,13 +4,14 @@
 
 use super::DNS_MAX_UDP_SIZE;
 use failure;
-use futures::{Async, Poll, Stream};
-use net::SocketAddr;
+use futures::{Async, Poll, Stream, try_ready};
+use std::net::SocketAddr;
 use std::io;
 use std::net;
 use std::rc::Rc;
-use tokio_core::net::UdpSocket;
-use tokio_core::reactor::Handle;
+use tokio::prelude::*;
+use tokio::reactor::Handle;
+use tokio::net::UdpSocket;
 
 pub struct UdpStream {
     udp_socket: UdpSocket,
@@ -23,11 +24,10 @@ impl UdpStream {
         Ok(UdpStream { udp_socket, buf })
     }
 
-    pub fn from_net_udp_socket(
+    pub fn from_std(
         net_udp_socket: net::UdpSocket,
-        handle: &Handle,
     ) -> Result<Self, io::Error> {
-        let udp_socket = UdpSocket::from_socket(net_udp_socket, handle)?;
+        let udp_socket = UdpSocket::from_std(net_udp_socket, &Handle::default())?;
         Self::from_socket(udp_socket)
     }
 }
@@ -41,7 +41,7 @@ impl Stream for UdpStream {
             let mut bufw = &mut self.buf;
             let capacity = bufw.capacity();
             unsafe { bufw.set_len(capacity) };
-            let (count, client_ip) = try_nb!(self.udp_socket.recv_from(&mut bufw));
+            let (count, client_ip) = try_ready!(self.udp_socket.poll_recv_from(&mut bufw));
             unsafe { bufw.set_len(count) };
             client_ip
         };

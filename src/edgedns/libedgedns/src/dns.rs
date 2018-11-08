@@ -2,12 +2,13 @@
 //! common responses.
 
 use dnssector::ParsedPacket;
-use errors::*;
+use crate::errors::*;
 use failure;
 use rand::random;
 use std::fmt;
 use std::io::Write;
 use std::net::SocketAddr;
+use log::{info, warn};
 
 use super::{DNS_UDP_NOEDNS0_MAX_SIZE, DNS_QUERY_MIN_SIZE, DNS_RESPONSE_MIN_SIZE};
 

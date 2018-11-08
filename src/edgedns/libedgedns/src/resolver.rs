@@ -5,22 +5,22 @@
 //! to communicating with upstream resolvers.
 
 use super::EdgeDNSContext;
-use cache::Cache;
-use client_query::ClientQuery;
+use crate::cache::Cache;
+use crate::client_query::ClientQuery;
 use coarsetime::{Duration, Instant};
-use config::Config;
-use dns::NormalizedQuestionKey;
-use ext_udp_listener::ExtUdpListener;
+use crate::config::Config;
+use crate::dns::NormalizedQuestionKey;
+use crate::ext_udp_listener::ExtUdpListener;
 use futures::Future;
 use futures::sync::mpsc::{channel, Receiver, Sender};
 use futures::sync::oneshot;
-use globals::Globals;
+use crate::globals::Globals;
 use jumphash::JumpHasher;
-use log_dnstap;
-use net_helpers::*;
+use crate::log_dnstap;
+use crate::net_helpers::*;
 use nix::sys::socket::{bind, setsockopt, sockopt, InetAddr, SockAddr};
 use parking_lot::RwLock;
-use resolver_queries_handler::{PendingQueries, ResolverQueriesHandler};
+use crate::resolver_queries_handler::{PendingQueries, ResolverQueriesHandler};
 use std::collections::HashMap;
 use std::io;
 use std::io::Cursor;
@@ -31,8 +31,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::thread;
-use tokio_core::reactor::{Core, Handle};
-use upstream_server::{UpstreamServer, UpstreamServerForQuery};
+use tokio::prelude::*;
+use tokio::runtime::Runtime;
+use crate::upstream_server::{UpstreamServer, UpstreamServerForQuery};
+use log::info;
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub enum LoadBalancingMode {
@@ -43,22 +45,16 @@ pub enum LoadBalancingMode {
 
 pub struct ResolverCore {
     pub globals: Globals,
-    pub handle: Handle,
     pub dnstap_sender: Option<log_dnstap::Sender>,
-    pub net_udp_socket: net::UdpSocket,
-    pub net_ext_udp_sockets_rc: Rc<Vec<net::UdpSocket>>,
+    pub net_ext_udp_sockets_rc: Arc<Vec<net::UdpSocket>>,
     pub decrement_ttl: bool,
     pub lbmode: LoadBalancingMode,
     pub jumphasher: JumpHasher,
 }
 
 impl ResolverCore {
-    pub fn spawn(edgedns_context: &EdgeDNSContext) -> io::Result<Globals> {
+    pub async fn spawn(edgedns_context: &EdgeDNSContext) -> io::Result<Globals> {
         let config = &edgedns_context.config;
-        let net_udp_socket = edgedns_context
-            .udp_socket
-            .try_clone()
-            .expect("Unable to clone the UDP listening socket");
         let (resolver_tx, resolver_rx): (Sender<ClientQuery>, Receiver<ClientQuery>) =
             channel(edgedns_context.config.max_active_queries);
         let mut net_ext_udp_sockets: Vec<net::UdpSocket> = Vec::new();
@@ -101,39 +97,29 @@ impl ResolverCore {
         let decrement_ttl = config.decrement_ttl;
         let lbmode = config.lbmode;
         let globals_inner = globals.clone();
-        thread::Builder::new()
-            .name("resolver".to_string())
-            .spawn(move || {
-                let mut event_loop = Core::new().expect("No event loop");
-                let handle = event_loop.handle();
-                let resolver_core = ResolverCore {
-                    globals: globals_inner,
-                    handle: handle.clone(),
-                    dnstap_sender,
-                    net_udp_socket,
-                    net_ext_udp_sockets_rc: Rc::new(net_ext_udp_sockets),
-                    decrement_ttl,
-                    lbmode,
-                    jumphasher: JumpHasher::default(),
-                };
-                info!("Registering UDP ports...");
-                for net_ext_udp_socket in &*resolver_core.net_ext_udp_sockets_rc {
-                    let ext_udp_listener = ExtUdpListener::new(&resolver_core, net_ext_udp_socket);
-                    let stream = ext_udp_listener
-                        .fut_process_stream(net_ext_udp_socket.try_clone().unwrap());
-                    handle.spawn(stream.map_err(|_| {}));
-                }
-                let resolver_queries_handler = ResolverQueriesHandler::new(&resolver_core);
-                let stream = resolver_queries_handler.fut_process_stream(&handle, resolver_rx);
-                event_loop
-                    .handle()
-                    .spawn(stream.map_err(|_| {}).map(|_| {}));
-                info!("UDP ports registered");
-                loop {
-                    event_loop.turn(None)
-                }
-            })
-            .unwrap();
+
+        let resolver_core = ResolverCore {
+            globals: globals_inner,
+            dnstap_sender,
+            net_ext_udp_sockets_rc: Arc::new(net_ext_udp_sockets),
+            decrement_ttl,
+            lbmode,
+            jumphasher: JumpHasher::default(),
+        };
+
+        info!("Registering UDP ports...");
+        for net_ext_udp_socket in &*resolver_core.net_ext_udp_sockets_rc {
+            let ext_udp_listener = ExtUdpListener::new(&resolver_core, net_ext_udp_socket);
+            let stream = ext_udp_listener
+                .fut_process_stream(net_ext_udp_socket.try_clone().unwrap());
+            tokio::spawn_async(async move { await!(stream); });
+        }
+
+        let resolver_queries_handler = ResolverQueriesHandler::new(&resolver_core);
+        let stream = resolver_queries_handler.fut_process_stream(resolver_rx);
+        info!("UDP ports registered");
+        tokio::spawn_async(async move { await!(stream); });
+
         Ok(globals)
     }
 }

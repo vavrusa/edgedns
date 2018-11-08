@@ -1,12 +1,12 @@
 use super::{DNS_UDP_NOEDNS0_MAX_SIZE, DNS_MAX_TCP_SIZE, DNS_MAX_UDP_SIZE, DNS_RESPONSE_MIN_SIZE,
             UPSTREAM_TOTAL_TIMEOUT_MS};
 use byteorder::{BigEndian, ByteOrder};
-use cache::*;
-use client_query::*;
-use dns;
-use dns::*;
+use crate::cache::*;
+use crate::client_query::*;
+use crate::dns;
+use crate::dns::*;
 use dnssector::*;
-use errors::*;
+use crate::errors::*;
 use failure;
 use futures::{future, Future};
 use futures::Async;
@@ -15,25 +15,41 @@ use futures::prelude::*;
 use futures::sync::mpsc::Sender;
 use futures::sync::oneshot;
 use futures::task;
-use globals::*;
-use hooks;
-use hooks::*;
+use crate::globals::*;
+use crate::hooks;
+use crate::hooks::*;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time;
-use tokio_timer::{Timeout, TimeoutError, Timer};
-use upstream_server::*;
+use std::error::Error;
+use tokio::prelude::*;
+use tokio::timer::Timeout;
+use crate::upstream_server::*;
+use log::debug;
+use xfailure::xbail;
+use bytes::{BytesMut, BufMut};
 
 pub struct Answer {
-    packet: Vec<u8>,
+    packet: Arc<Vec<u8>>,
     ttl: Option<u32>,
     special: bool,
+}
+
+impl From<Arc<Vec<u8>>> for Answer {
+    fn from(packet: Arc<Vec<u8>>) -> Answer {
+        Answer {
+            packet: packet,
+            ttl: None,
+            special: false,
+        }
+    }
 }
 
 impl From<Vec<u8>> for Answer {
     fn from(packet: Vec<u8>) -> Answer {
         Answer {
-            packet,
+            packet: Arc::new(packet),
             ttl: None,
             special: false,
         }
@@ -43,7 +59,7 @@ impl From<Vec<u8>> for Answer {
 impl From<(Vec<u8>, u32)> for Answer {
     fn from(packet_ttl: (Vec<u8>, u32)) -> Answer {
         Answer {
-            packet: packet_ttl.0,
+            packet: Arc::new(packet_ttl.0),
             ttl: Some(packet_ttl.1),
             special: false,
         }
@@ -52,38 +68,38 @@ impl From<(Vec<u8>, u32)> for Answer {
 
 pub enum PacketOrFuture {
     Packet(Vec<u8>),
-    Future(Box<Future<Item = Vec<u8>, Error = failure::Error>>),
-    PacketAndFuture((Vec<u8>, Box<Future<Item = Vec<u8>, Error = failure::Error>>)),
+    Future(Box<Future<Item = Vec<u8>, Error = failure::Error> + Send>),
+    PacketAndFuture((Vec<u8>, Box<Future<Item = Vec<u8>, Error = failure::Error> + Send>)),
 }
 
 pub enum AnswerOrFuture {
     Answer(Answer),
-    Future(Box<Future<Item = (Answer, Option<SessionState>), Error = failure::Error>>),
+    Future(Box<Future<Item = (Answer, Option<SessionState>), Error = failure::Error> + Send>),
     AnswerAndFuture(
         (
             Answer,
-            Box<Future<Item = (Answer, Option<SessionState>), Error = failure::Error>>,
+            Box<Future<Item = (Answer, Option<SessionState>), Error = failure::Error> + Send>,
         ),
     ),
 }
 
 pub struct QueryRouter {
-    globals: Rc<Globals>,
+    globals: Arc<Globals>,
     session_state: Option<SessionState>,
-    timer: Timer,
 }
 
 impl QueryRouter {
     fn rewrite_according_to_original_query(
         &self,
         parsed_packet: &mut ParsedPacket,
+        mut packet: &mut BytesMut,
         answer: Answer,
         protocol: ClientQueryProtocol,
-    ) -> Result<Vec<u8>, failure::Error> {
-        let mut packet = answer.packet;
-        if packet.len() < DNS_RESPONSE_MIN_SIZE || !dns::qr(&packet) {
+    ) -> Result<(), failure::Error> {
+        if answer.packet.len() < DNS_RESPONSE_MIN_SIZE || !dns::qr(&answer.packet) {
             xbail!(DNSError::Unexpected);
         }
+        packet.put_slice(&*answer.packet);
         if let Some(ttl) = answer.ttl {
             dns::set_ttl(&mut packet, ttl).map_err(|_| DNSError::InternalError)?
         };
@@ -99,134 +115,131 @@ impl QueryRouter {
         let tid = parsed_packet.tid();
         dns::set_tid(&mut packet, tid);
 
-        let packet_len = packet.len();
-        if packet.len() < DNS_RESPONSE_MIN_SIZE
-            || (protocol == ClientQueryProtocol::UDP && packet_len > DNS_MAX_UDP_SIZE)
-            || (protocol == ClientQueryProtocol::TCP && packet_len > DNS_MAX_TCP_SIZE)
-        {
-            let normalized_question = match NormalizedQuestion::from_parsed_packet(parsed_packet) {
-                Ok(normalized_question) => normalized_question,
-                Err(_) => xbail!(DNSError::InvalidPacket),
-            };
-            let (qtype, qclass) = parsed_packet.qtype_qclass().ok_or(DNSError::Unexpected)?;
-            let original_qname = match parsed_packet.question_raw() {
-                Some((original_qname, ..)) => original_qname,
-                None => xbail!(DNSError::Unexpected),
-            };
-            packet = dns::build_refused_packet(original_qname, qtype, qclass, tid)?;
-        }
+        // let packet_len = packet.len();
+        // if packet.len() < DNS_RESPONSE_MIN_SIZE
+        //     || (protocol == ClientQueryProtocol::UDP && packet_len > DNS_MAX_UDP_SIZE)
+        //     || (protocol == ClientQueryProtocol::TCP && packet_len > DNS_MAX_TCP_SIZE)
+        // {
+        //     let normalized_question = match NormalizedQuestion::from_parsed_packet(parsed_packet) {
+        //         Ok(normalized_question) => normalized_question,
+        //         Err(_) => xbail!(DNSError::InvalidPacket),
+        //     };
+        //     let (qtype, qclass) = parsed_packet.qtype_qclass().ok_or(DNSError::Unexpected)?;
+        //     let original_qname = match parsed_packet.question_raw() {
+        //         Some((original_qname, ..)) => original_qname,
+        //         None => xbail!(DNSError::Unexpected),
+        //     };
+        //     packet = dns::build_refused_packet(original_qname, qtype, qclass, tid)?;
+        // }
 
-        match protocol {
-            ClientQueryProtocol::UDP
-                if packet_len > DNS_UDP_NOEDNS0_MAX_SIZE as usize
-                    && (packet_len > DNS_MAX_UDP_SIZE as usize
-                        || packet_len > parsed_packet.max_payload()) =>
-            {
-                let (qtype, qclass) = parsed_packet.qtype_qclass().ok_or(DNSError::Unexpected)?;
-                let original_qname = match parsed_packet.question_raw() {
-                    Some((original_qname, ..)) => original_qname,
-                    None => xbail!(DNSError::Unexpected),
-                };
-                packet = dns::build_tc_packet(original_qname, qtype, qclass, tid)?;
-            }
-            ClientQueryProtocol::UDP => debug_assert!(packet_len <= DNS_MAX_UDP_SIZE),
+        // match protocol {
+        //     ClientQueryProtocol::UDP
+        //         if packet_len > DNS_UDP_NOEDNS0_MAX_SIZE as usize
+        //             && (packet_len > DNS_MAX_UDP_SIZE as usize
+        //                 || packet_len > parsed_packet.max_payload()) =>
+        //     {
+        //         let (qtype, qclass) = parsed_packet.qtype_qclass().ok_or(DNSError::Unexpected)?;
+        //         let original_qname = match parsed_packet.question_raw() {
+        //             Some((original_qname, ..)) => original_qname,
+        //             None => xbail!(DNSError::Unexpected),
+        //         };
+        //         packet = dns::build_tc_packet(original_qname, qtype, qclass, tid)?;
+        //     }
+        //     ClientQueryProtocol::UDP => debug_assert!(packet_len <= DNS_MAX_UDP_SIZE),
 
-            ClientQueryProtocol::TCP => {
-                if packet_len > DNS_MAX_TCP_SIZE {
-                    xbail!(DNSError::InternalError)
-                }
-                packet.reserve(2);
-                unsafe {
-                    packet.set_len(2 + packet_len);
-                    ptr::copy(packet.as_ptr(), packet.as_mut_ptr().offset(2), packet_len);
-                }
-                BigEndian::write_u16(&mut packet, packet_len as u16);
-            }
-        }
-        Ok(packet)
+        //     ClientQueryProtocol::TCP => {
+        //         if packet_len > DNS_MAX_TCP_SIZE {
+        //             xbail!(DNSError::InternalError)
+        //         }
+        //         packet.reserve(2);
+        //         unsafe {
+        //             packet.set_len(2 + packet_len);
+        //             ptr::copy(packet.as_ptr(), packet.as_mut_ptr().offset(2), packet_len);
+        //         }
+        //         BigEndian::write_u16(&mut packet, packet_len as u16);
+        //     }
+        // }
+        Ok(())
     }
 
     fn deliver_to_client(
         &mut self,
         parsed_packet: &mut ParsedPacket,
-        mut answer: Answer,
+        response_packet: &mut BytesMut,
+        answer: Answer,
         protocol: ClientQueryProtocol,
-    ) -> Result<Vec<u8>, failure::Error> {
-        let hooks_arc = self.globals.hooks_arc.read();
-        if hooks_arc.enabled(Stage::Deliver) {
-            let (action, packet) = hooks_arc
-                .apply_serverside(
-                    self.session_state.as_mut().unwrap(),
-                    answer.packet.clone(),
-                    Stage::Deliver,
-                )
-                .map_err(|e| DNSError::HookError(e))?;
-            match action {
-                Action::Deliver | Action::Synth | Action::Pass | Action::Pipe => {
-                    answer.packet = packet;
-                }
-                Action::Fail => {
-                    let tid = parsed_packet.tid();
-                    let (qtype, qclass) = parsed_packet.qtype_qclass().ok_or(DNSError::Unexpected)?;
-                    let original_qname = match parsed_packet.question_raw() {
-                        Some((original_qname, ..)) => original_qname,
-                        None => xbail!(DNSError::Unexpected),
-                    };
-                    answer.packet = dns::build_refused_packet(original_qname, qtype, qclass, tid)?;
-                }
-                _ => return Err(DNSError::Refused.into()),
-            }
-        }
-        self.rewrite_according_to_original_query(parsed_packet, answer, protocol)
+    ) -> Result<(), failure::Error> {
+        // let hooks_arc = self.globals.hooks_arc.read();
+        // if hooks_arc.enabled(Stage::Deliver) {
+        //     let (action, packet) = hooks_arc
+        //         .apply_serverside(
+        //             self.session_state.as_mut().unwrap(),
+        //             answer.packet.clone(),
+        //             Stage::Deliver,
+        //         )
+        //         .map_err(|e| DNSError::HookError(e))?;
+        //     match action {
+        //         Action::Deliver | Action::Synth | Action::Pass | Action::Pipe => {
+        //             answer.packet = packet;
+        //         }
+        //         Action::Fail => {
+        //             let tid = parsed_packet.tid();
+        //             let (qtype, qclass) = parsed_packet.qtype_qclass().ok_or(DNSError::Unexpected)?;
+        //             let original_qname = match parsed_packet.question_raw() {
+        //                 Some((original_qname, ..)) => original_qname,
+        //                 None => xbail!(DNSError::Unexpected),
+        //             };
+        //             answer.packet = dns::build_refused_packet(original_qname, qtype, qclass, tid)?;
+        //         }
+        //         _ => return Err(DNSError::Refused.into()),
+        //     }
+        // }
+        self.rewrite_according_to_original_query(parsed_packet, response_packet, answer, protocol)
     }
 
     pub fn create(
-        globals: Rc<Globals>,
+        globals: Arc<Globals>,
         mut parsed_packet: ParsedPacket,
+        response: &mut BytesMut,
         protocol: ClientQueryProtocol,
         session_state: SessionState,
-        timer: Timer,
-    ) -> PacketOrFuture {
+    ) -> Option<Box<Future<Item = (), Error = failure::Error> + Send>> {
         let mut query_router = QueryRouter {
             globals,
             session_state: Some(session_state),
-            timer,
         };
+        let mut resp_clone = response.clone();
         match query_router.create_answer(&mut parsed_packet) {
             Ok(AnswerOrFuture::Answer(answer)) => {
-                let packet =
-                    match query_router.deliver_to_client(&mut parsed_packet, answer, protocol) {
-                        Ok(packet) => packet,
-                        Err(e) => return PacketOrFuture::Future(Box::new(future::err(e))),
-                    };
-                PacketOrFuture::Packet(packet)
+                    match query_router.deliver_to_client(&mut parsed_packet, response, answer, protocol) {
+                        Ok(packet) => None,
+                        Err(e) => Some(Box::new(future::err(e)))
+                    }
             }
             Ok(AnswerOrFuture::Future(future)) => {
                 let fut = future.and_then(move |(answer, session_state)| {
                     query_router.session_state =
                         session_state.or_else(|| Some(SessionState::default()));
                     let packet = query_router
-                        .deliver_to_client(&mut parsed_packet, answer, protocol)
+                        .deliver_to_client(&mut parsed_packet, &mut resp_clone, answer, protocol)
                         .expect("Unable to rewrite according to the original query");
                     future::ok(packet)
-                });
-                PacketOrFuture::Future(Box::new(fut))
+                }).then(|packet| packet);
+                Some(Box::new(fut))
             }
             Ok(AnswerOrFuture::AnswerAndFuture((answer, future))) => {
-                let packet =
-                    match query_router.deliver_to_client(&mut parsed_packet, answer, protocol) {
-                        Ok(packet) => packet,
-                        Err(e) => return PacketOrFuture::Future(Box::new(future::err(e))),
-                    };
+                match query_router.deliver_to_client(&mut parsed_packet, response, answer, protocol) {
+                    Ok(packet) => {},
+                    Err(e) => return Some(Box::new(future::err(e))),
+                };
                 let fut = future.and_then(move |(answer, session_state)| {
                     query_router.session_state =
                         session_state.or_else(|| Some(SessionState::default()));
-                    let packet = vec![];
-                    future::ok(packet)
+                    future::ok(())
                 });
-                PacketOrFuture::PacketAndFuture((packet, Box::new(fut)))
+                Some(Box::new(fut))
             }
-            Err(e) => PacketOrFuture::Future(Box::new(future::err(e))),
+            Err(e) => Some(Box::new(future::err(e))),
         }
     }
 
@@ -301,28 +314,7 @@ impl QueryRouter {
             }
         }
         let answer_from_cache = if let Some(answer_from_cache) = answer_from_cache {
-            if hooks_arc.enabled(Stage::Hit) {
-                let (action, packet) = hooks_arc
-                    .apply_serverside(
-                        self.session_state.as_mut().unwrap(),
-                        answer_from_cache.packet.clone(), // XXX - Remove clone()
-                        Stage::Hit,
-                    )
-                    .map_err(|e| DNSError::HookError(e))?;
-                match action {
-                    Action::Pass | Action::Miss | Action::Fetch => {}
-                    Action::Deliver | Action::Default => {
-                        if !prefetched {
-                            return Ok(AnswerOrFuture::Answer(Answer::from(packet)));
-                        }
-                    }
-                    Action::Drop | Action::Fail => return Err(DNSError::Refused.into()),
-                    _ => return Err(DNSError::Unimplemented.into()),
-                }
-                Some(answer_from_cache)
-            } else {
                 return Ok(AnswerOrFuture::Answer(answer_from_cache));
-            }
         } else {
             if hooks_arc.enabled(Stage::Miss) {
                 let action = hooks_arc
@@ -361,11 +353,16 @@ impl QueryRouter {
                 Ok((answer, resolver_response.session_state))
             });
 
-        let client_query_fut = fut_send.and_then(move |_| client_query_fut);
-        let fut_timeout = self.timer.timeout(
-            client_query_fut,
-            time::Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS),
-        );
+        let fut_timeout = fut_send
+            .and_then(move |_| client_query_fut)
+            .timeout(time::Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
+            .map_err(move |e| {
+                if e.is_inner() {
+                    e.into_inner().unwrap()   
+                } else {
+                    DNSError::TimerError.into()
+                }
+            });
 
         if prefetched {
             Ok(AnswerOrFuture::AnswerAndFuture((

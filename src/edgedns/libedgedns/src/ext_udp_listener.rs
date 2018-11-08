@@ -14,34 +14,33 @@
 //! the `DO` bit in the case of the query name in order to lift this ambiguity.
 
 use super::{DNS_QUERY_MIN_SIZE, FAILURE_TTL};
-use cache::{Cache, CacheKey};
-use client_query::ClientQuery;
-use config::Config;
-use dns::{min_ttl, rcode, set_ttl, tid, NormalizedQuestionKey, UpstreamQuestion,
+use crate::cache::{Cache, CacheKey};
+use crate::client_query::ClientQuery;
+use crate::config::Config;
+use crate::dns::{min_ttl, rcode, set_ttl, tid, NormalizedQuestionKey, UpstreamQuestion,
           DNS_RCODE_SERVFAIL};
-use errors::*;
+use crate::errors::*;
 use failure;
 use futures::Future;
 use futures::Stream;
 use futures::future;
-use globals::Globals;
-use log_dnstap;
+use crate::globals::Globals;
+use crate::log_dnstap;
 use parking_lot::RwLock;
-use resolver::ResolverCore;
+use crate::resolver::ResolverCore;
 use std::io;
 use std::net::{self, SocketAddr};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
-use tokio_core::reactor::Handle;
-use udp_stream::*;
-use upstream_server::UpstreamServer;
-use varz::Varz;
+use tokio::prelude::*;
+use crate::udp_stream::*;
+use crate::upstream_server::UpstreamServer;
+use crate::varz::Varz;
+use log::{debug, info, warn};
 
 pub struct ExtUdpListener {
     globals: Globals,
-    handle: Handle,
     local_port: u16,
 }
 
@@ -53,7 +52,6 @@ impl ExtUdpListener {
         );
         ExtUdpListener {
             globals: resolver_core.globals.clone(),
-            handle: resolver_core.handle.clone(),
             local_port: net_ext_udp_socket.local_addr().unwrap().port(),
         }
     }
@@ -62,7 +60,7 @@ impl ExtUdpListener {
         mut self,
         net_ext_udp_socket: net::UdpSocket,
     ) -> impl Future<Item = (), Error = failure::Error> {
-        let fut_ext_socket = UdpStream::from_net_udp_socket(net_ext_udp_socket, &self.handle)
+        let fut_ext_socket = UdpStream::from_std(net_ext_udp_socket)
             .expect("Cannot create a UDP stream")
             .for_each(move |(packet, client_addr)| {
                 self.fut_process_ext_socket(packet, client_addr)

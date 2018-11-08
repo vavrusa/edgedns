@@ -1,19 +1,14 @@
-extern crate clap;
-extern crate prost;
-#[macro_use]
-extern crate prost_derive;
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate tokio_uds;
-
+use prost_derive::*;
 use clap::{App, Arg};
-use prost::Message;
+use prost::{Message};
 use std::str;
-use tokio_core::reactor::Core;
-use tokio_io::io::write_all;
-use tokio_uds::UnixStream;
+use tokio::prelude::*;
+use tokio::io::write_all;
+use tokio::net::UnixStream;
 
 pub mod cli {
+    use prost::*;
+    use prost_derive::*;
     include!(concat!(env!("OUT_DIR"), "/edgedns.cli.rs"));
 }
 
@@ -25,14 +20,16 @@ struct CLI {
 
 impl CLI {
     fn send_to_socket(&self, serialized: Vec<u8>) {
-        let mut event_loop = Core::new().expect("No event loop");
-        let handle = event_loop.handle();
-        let socket = UnixStream::connect(&self.socket_path, &handle).expect(&format!(
-            "Unable to connect to a unix socket named {}",
-            &self.socket_path
-        ));
-        let task = write_all(socket, serialized);
-        event_loop.run(task).unwrap();
+        let path = self.socket_path.clone();
+        let client = UnixStream::connect(&path)
+            .and_then(|stream| {
+                write_all(stream, serialized).then(|_| { Ok(()) })
+            })
+            .map_err(move |err| {
+                    println!("Unable to connect to a unix socket named {:?}: {:?}", path, err);
+            });
+             
+        tokio::run(client);
     }
 
     fn service_load(&self, service_id: &str, library_path: &str) {

@@ -4,26 +4,26 @@
 use super::{DNS_MAX_TCP_SIZE, DNS_MAX_UDP_SIZE, DNS_QUERY_MIN_SIZE};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
 use coarsetime::Instant;
-use dns::{self, NormalizedQuestion};
+use crate::dns::{self, NormalizedQuestion};
 use dnssector::*;
-use errors::*;
+use crate::errors::*;
 use failure;
 use futures::{future, Future};
 use futures::Sink;
 use futures::sync::mpsc::Sender;
 use futures::sync::oneshot;
 use futures::task::{self, Task};
-use hooks::{Hooks, SessionState, Stage};
+use crate::hooks::{Hooks, SessionState, Stage};
 use parking_lot::RwLock;
 use std::io;
 use std::net::{self, SocketAddr};
 use std::sync::Arc;
-use upstream_server::UpstreamServerForQuery;
-use varz::Varz;
+use crate::upstream_server::UpstreamServerForQuery;
+use crate::varz::Varz;
 
 #[derive(Clone, Debug)]
 pub struct ResolverResponse {
-    pub packet: Vec<u8>,
+    pub packet: Arc<Vec<u8>>,
     pub dnssec: bool,
     pub session_state: Option<SessionState>,
 }

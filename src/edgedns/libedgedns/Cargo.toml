@@ -3,10 +3,12 @@ name = "libedgedns"
 version = "0.3.0"
 authors = ["Frank Denis <github@pureftpd.org>"]
 publish = false
+edition = "2018"
 
 [features]
 webservice = ["hyper"]
 nightly = ["prometheus/nightly"]
+jemalloc = ["jemallocator"]
 
 [[bin]]
 name = "edgedns"
@@ -27,8 +29,9 @@ failure = "*"
 failure_derive = "*"
 futures = "*"
 glob = "*"
-hyper = {version = "*", optional = true}
-jumphash = "*"
+hyper = {version = "~0.12", optional = true}
+mime = "*"
+jumphash = {git = "https://github.com/jedisct1/rust-jumphash"}
 lazy_static = "*"
 libc = "*"
 libloading = "*"
@@ -36,7 +39,7 @@ log = "*"
 net2 = "*"
 nix = "~0.8 "
 parking_lot = "*"
-privdrop = "*"
+privdrop = "0.2.1"
 prometheus = {git = "https://github.com/pingcap/rust-prometheus", default-features = false}
 prost = "*"
 prost-derive = "*"
@@ -46,18 +49,18 @@ rand = "*"
 siphasher = "*"
 slab = "*"
 socket-priority = "*"
-tokio-core = "*"
-tokio-io = "*"
-tokio-timer = "*"
-tokio-uds = "*"
 toml = "*"
 unicase = "*"
 xfailure = "*"
+tokio = { version = "*", features=["async-await-preview"] }
+tokio-async-await = { git = "https://github.com/tokio-rs/tokio" }
+jemallocator = {version = "*", optional = true}
 
 [build-dependencies]
 prost-build = "*"
 
 [profile.release]
+debug = true
 lto = true
 panic = "abort"
 opt-level = 3

@@ -5,22 +5,22 @@
 type = "forwarder"
 
 # Upstream servers
-servers = ["8.8.8.8:53", "8.8.4.4:53"]
+#servers = ["1.1.1.1:53", "9.9.9.9:53"]
+servers = ["1.1.1.1:53", "9.9.9.9:53"]
 
-# Load balancing/failover strategy: "uniform", "consistent" or "minload"
-strategy = "uniform"
+# Load balancing/failover strategy: "uniform", "fallback" or "minload"
+strategy = "consistent"
 
 # Max duration with a majority of failures before marking a server as temporarily
 # unresponsive. That value should be specificied in ms.
 max_failure_duration = 2500
-
 
 [cache]
 # Max number of cached entries
 max_items = 250000
 
 # Minimum TTL - Records with a TTL shorter than that one will not trigger a
-# cache refresh. Increasing that value increases the cache hit ratio,
+# cache refrseh. Increasing that value increases the cache hit ratio,
 # improves reliability and reduces the load on upstream servers, but zones
 # changes will obviously require more time to be visible by clients.
 min_ttl = 60
@@ -35,15 +35,15 @@ max_ttl = 86400
 udp_ports = 8
 
 # Listen address
-listen = "0.0.0.0:53"
+listen = "127.0.0.1:5354"
 
 
 [webservice]
 # Change to `true` in order to start the webservice
-enabled = false
+enabled = true
 
 # Webservice address for Prometheus. Path will be /metrics
-listen = "0.0.0.0:9090"
+listen = "127.0.0.1:9090"
 
 
 [dnstap]
@@ -54,7 +54,7 @@ enabled = false
 # backlog = 4096
 
 # UNIX socket path, relative to the chroot directory
-socket_path = "/var/run/edgedns.dnstap"
+socket_path = "edgedns.dnstap"
 
 
 [global]
@@ -69,14 +69,14 @@ socket_path = "/var/run/edgedns.dnstap"
 
 # Number of threads handling client queries received over UDP
 # More than 1 is rarely required. Set to 0 to disable UDP.
-threads_udp = 1
+threads_udp = 4
 
 # Number of threads handling client queries received over TCP
 # More than 1 is very rarely required. Set to 0 to disable TCP.
 threads_tcp = 1
 
 # Max number of clients using TCP
-max_tcp_clients = 100
+max_tcp_clients = 6
 
 # Max number of clients waiting for a response
 max_waiting_clients = 1000000
@@ -91,12 +91,11 @@ max_clients_waiting_for_query = 1000
 # identity = "hostname"
 
 # Version (optional) - Should be set to the software name
-version = "EdgeDNS"
+version = "EdgeDNS-dev"
 
-
-[hooks]
+#[hooks]
 # Base directory for the dynamic libraries
-basedir = "."
+#basedir = "."
 
 # UNIX socket to control the server from the CLI
-socket_path = "/tmp/edgedns.sock"
+#socket_path = "/tmp/edgedns.sock"

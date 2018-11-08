@@ -3,16 +3,49 @@
 //! This configuration cannot currently be updated without restarting the
 //! server.
 
-use coarsetime::Duration;
-use resolver::LoadBalancingMode;
+use crate::forwarder::LoadBalancingMode;
 use std::fs::File;
-use std::io::{Error, ErrorKind};
 use std::io::prelude::*;
+use std::io::{Error, ErrorKind};
 use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
 use toml;
 
-#[derive(Clone, Debug)]
+/// EdgeDNS server type definition.
+/// The server can operate in either forwarder mode, or fully recursive mode.
+/// The forwarder mode can be set to either decrement TTL or not.
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+pub enum ServerType {
+    Authoritative,
+    Forwarder,
+    Recursive,
+}
+
+impl Default for ServerType {
+    fn default() -> ServerType {
+        ServerType::Authoritative
+    }
+}
+
+impl FromStr for ServerType {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "authoritative" => Ok(ServerType::Authoritative),
+            "forwarder" => Ok(ServerType::Forwarder),
+            "recursive" => Ok(ServerType::Recursive),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid value for the server type",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Config {
+    pub server_type: ServerType,
     pub decrement_ttl: bool,
     pub upstream_servers_str: Vec<String>,
     pub lbmode: LoadBalancingMode,
@@ -32,8 +65,8 @@ pub struct Config {
     pub dnstap_enabled: bool,
     pub dnstap_backlog: usize,
     pub dnstap_socket_path: Option<String>,
-    pub dnstap_identity: Option<String>,
-    pub dnstap_version: Option<String>,
+    pub identity: Option<String>,
+    pub version: Option<String>,
     pub max_tcp_clients: usize,
     pub max_waiting_clients: usize,
     pub max_active_queries: usize,
@@ -57,7 +90,7 @@ impl Config {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     "Syntax error - config file is not valid TOML",
-                ))
+                ));
             }
         };
         Self::parse(&toml_config)
@@ -65,21 +98,17 @@ impl Config {
 
     fn parse(toml_config: &toml::Value) -> Result<Config, Error> {
         let config_upstream = toml_config.get("upstream");
-        let decrement_ttl_str = config_upstream
+        let server_type = config_upstream
             .and_then(|x| x.get("type"))
             .map_or("authoritative", |x| {
                 x.as_str().expect("upstream.type must be a string")
-            });
-        let decrement_ttl = match decrement_ttl_str {
-            "authoritative" => false,
-            "resolver" => true,
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Invalid value for the type of upstream servers. Must be \
-                     'authoritative or 'resolver'",
-                ))
-            }
+            })
+            .parse()
+            .expect("upstream.type");
+        let decrement_ttl = match server_type {
+            ServerType::Authoritative => false,
+            ServerType::Forwarder => true,
+            ServerType::Recursive => true,
         };
 
         let upstream_servers_str = config_upstream
@@ -102,22 +131,24 @@ impl Config {
             });
         let lbmode = match lbmode_str {
             "uniform" => LoadBalancingMode::Uniform,
-            "fallback" => LoadBalancingMode::Fallback,
-            "minload" => LoadBalancingMode::P2,
+            "consistent" => LoadBalancingMode::Consistent,
+            // "minload" => LoadBalancingMode::MinLoad,
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     "Invalid value for the load balancing/failover strategy",
-                ))
+                ));
             }
         };
 
-        let upstream_max_failure_duration = Duration::from_millis(config_upstream
-            .and_then(|x| x.get("max_failure_duration"))
-            .map_or(2500, |x| {
-                x.as_integer()
-                    .expect("upstream.max_failure_duration must be an integer")
-            }) as u64);
+        let upstream_max_failure_duration = Duration::from_millis(
+            config_upstream
+                .and_then(|x| x.get("max_failure_duration"))
+                .map_or(2500, |x| {
+                    x.as_integer()
+                        .expect("upstream.max_failure_duration must be an integer")
+                }) as u64,
+        );
 
         let config_cache = toml_config.get("cache");
 
@@ -200,13 +231,13 @@ impl Config {
                     .expect("global.threads_tcp must be an integer")
             }) as usize;
 
-        let max_tcp_clients = config_global.and_then(|x| x.get("max_tcp_clients")).map_or(
-            250,
-            |x| {
-                x.as_integer()
-                    .expect("global.max_tcp_clients must be an integer")
-            },
-        ) as usize;
+        let max_tcp_clients =
+            config_global
+                .and_then(|x| x.get("max_tcp_clients"))
+                .map_or(250, |x| {
+                    x.as_integer()
+                        .expect("global.max_tcp_clients must be an integer")
+                }) as usize;
 
         let max_waiting_clients = config_global
             .and_then(|x| x.get("max_waiting_clients"))
@@ -229,6 +260,18 @@ impl Config {
                     .expect("global.max_clients_waiting_for_query must be an integer")
             }) as usize;
 
+        let identity = config_global.and_then(|x| x.get("identity")).map(|x| {
+            x.as_str()
+                .expect("global.identity must be a string")
+                .to_owned()
+        });
+
+        let version = config_global.and_then(|x| x.get("version")).map(|x| {
+            x.as_str()
+                .expect("global.version must be a string")
+                .to_owned()
+        });
+
         let config_dnstap = toml_config.get("dnstap");
 
         let dnstap_enabled = config_dnstap
@@ -249,18 +292,6 @@ impl Config {
                 .to_owned()
         });
 
-        let dnstap_identity = config_dnstap.and_then(|x| x.get("identity")).map(|x| {
-            x.as_str()
-                .expect("dnstap.identity must be a string")
-                .to_owned()
-        });
-
-        let dnstap_version = config_dnstap.and_then(|x| x.get("version")).map(|x| {
-            x.as_str()
-                .expect("dnstap.version must be a string")
-                .to_owned()
-        });
-
         let config_hooks = toml_config.get("hooks");
 
         let hooks_basedir = config_hooks.and_then(|x| x.get("basedir")).map(|x| {
@@ -276,6 +307,7 @@ impl Config {
         });
 
         Ok(Config {
+            server_type,
             decrement_ttl,
             upstream_servers_str,
             lbmode,
@@ -295,8 +327,8 @@ impl Config {
             dnstap_enabled,
             dnstap_backlog,
             dnstap_socket_path,
-            dnstap_identity,
-            dnstap_version,
+            identity,
+            version,
             max_tcp_clients,
             max_waiting_clients,
             max_active_queries,

@@ -1,0 +1,28 @@
+[package]
+name = "logger"
+version = "0.1.0"
+authors = ["Marek Vavruša <mvavrusa@cloudflare.com>"]
+edition = "2018"
+build = "build.rs"
+
+[lib]
+name = "logger"
+crate-type = ["cdylib"]
+
+[dependencies]
+futures-preview = { version = "=0.3.0-alpha.12" }
+embrio-async = {git = "https://github.com/Nemo157/embrio-rs", rev = "73853731f00b1babefe572fe8b339f188e1a17db"}
+wee_alloc = {version = "0.4"}
+guest = {path = "../../guest", features = ["futures", "std"]}
+capnp = "0.9"
+byteorder = "1"
+
+[build-dependencies]
+capnpc = "0.9"
+
+[profile.release]
+lto = true
+opt-level = 'z'
+
+[workspace]
+members = []

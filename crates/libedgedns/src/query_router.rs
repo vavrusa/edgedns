@@ -1,7 +1,8 @@
+use crate::conductor::Origin;
 use crate::cache::CacheEntry;
 use crate::config::ServerType;
 use crate::context::Context;
-use crate::error::Result;
+use crate::error::{Result, Error};
 use crate::forwarder::Forwarder;
 use crate::recursor::Recursor;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -10,11 +11,13 @@ use domain_core::iana::{Class, Rcode, Rtype};
 use domain_core::rdata::Txt;
 use lazy_static::*;
 use log::*;
-use std::io::ErrorKind;
+use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::prelude::*;
 use tokio::await;
+use futures::Future;
 
 #[derive(Clone)]
 pub struct Scope {
@@ -54,6 +57,7 @@ pub struct QueryRouter {
 impl QueryRouter {
     pub fn new(context: Arc<Context>) -> Self {
         let config = &context.config;
+        
         Self {
             router: match config.server_type {
                 ServerType::Recursive => QueryRouterVariant::Recursor(Recursor::new(config)),
@@ -81,6 +85,31 @@ impl QueryRouter {
 
         // Process query
         self.context.varz.inflight_queries.inc();
+
+        // Process pre-flight hooks
+        // let res = await!(self.resolvers.iter().fold(
+        //     Box::new(future::ok(())) as HookFuture,
+        //     |acc, task| {
+        //         Box::new(acc.and_then(move |_| task.resolve()))
+        //     }));
+        // let res = await!(stream::iter_ok::<_, IoError>(self.resolvers.iter())
+        // //     .map(move |hook| {
+        // //         hook.resolve().into_future()
+        // //     })
+        //     .for_each(move |f| f.resolve().into_future().then(|_| {
+        //         Ok(())
+        //     }))
+        //     // .fold(Action::Pass, move |acc, res| {
+        //     //     // eprintln!("acc {:#?} res {:#?}", acc, res);
+        //     //     Ok::<_, IoError>(acc)
+        //     // })
+        //     // .and_then(move |acc| {
+        //     //     eprintln!("res {:#?}", acc);
+        //     //     Ok(())
+        //     // })
+            // );
+        // eprintln!("hooks res {:#?}", res);
+       
         let mut cache = self.context.cache.clone();
         let cache_key = (&scope.question).into();
         let answer = match cache.get(&cache_key) {
@@ -119,7 +148,7 @@ lazy_static! {
 }
 
 /// Resolve from cached entry.
-fn resolve_from_cache(scope: &Scope, entry: CacheEntry, mut answer: BytesMut) -> Result<BytesMut> {
+fn resolve_from_cache(scope: &Scope, entry: CacheEntry, answer: BytesMut) -> Result<BytesMut> {
     let cached = entry.as_message();
     let elapsed = entry.elapsed();
 
@@ -132,35 +161,20 @@ fn resolve_from_cache(scope: &Scope, entry: CacheEntry, mut answer: BytesMut) ->
     message.push(scope.question.clone()).unwrap();
 
     // Copy records from section with decayed TTL
-    let mut message = message.stream();
-    cached
-        .iter()
-        .filter_map(|(rr, section)| {
-            // Filter invalid records
-            match rr {
-                Ok(rr) => {
-                    if let Ok(Some(rr)) = rr.into_record::<UnknownRecordData>() {
-                        Some((rr, section))
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
+    let result = cached.copy_records(message, |parsed| {
+        if let Ok(rr) = parsed {
+            if let Ok(Some(mut rr)) = rr.into_record::<UnknownRecordData>() {
+                rr.set_ttl(rr.ttl().saturating_sub(elapsed));
+                return Some(rr);
             }
-        })
-        .map(|(mut rr, section)| {
-            rr.set_ttl(rr.ttl().saturating_sub(elapsed));
-            (rr, section)
-        })
-        .for_each(|(rr, section)| {
-            // Push to the response
-            drop(message.push(rr, section));
-        });
+        }
+        None
+    });
 
-    // TODO: copy OPT from query
-
-    answer = message.finish();
-    Ok(answer)
+    match result {
+        Ok(message) => Ok(message.finish()),
+        Err(e) => Err(Error::Io(ErrorKind::InvalidData.into())),
+    }
 }
 
 /// Fallback handler to resolve CHAOS zone requests

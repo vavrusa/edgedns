@@ -23,7 +23,7 @@ bytes = "*"
 jumphash = {git = "https://github.com/jedisct1/rust-jumphash"}
 tokio = {git = "https://github.com/tokio-rs/tokio", features=["async-await-preview"]}
 domain-core = {git = "https://github.com/vavrusa/domain-core"}
-kres = {git = "https://github.com/vavrusa/rust-kres"}
+kres = {git = "https://github.com/vavrusa/rust-kres", features=["static"]}
 parking_lot = {version = "0.6", features = ["nightly"]}
 clockpro-cache = {git = "https://github.com/jedisct1/rust-clockpro-cache"}
 prometheus = "*"

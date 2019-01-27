@@ -24,7 +24,7 @@ pub enum ServerType {
 
 impl Default for ServerType {
     fn default() -> ServerType {
-        ServerType::Authoritative
+        ServerType::Forwarder
     }
 }
 
@@ -43,7 +43,7 @@ impl FromStr for ServerType {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub server_type: ServerType,
     pub decrement_ttl: bool,
@@ -73,6 +73,41 @@ pub struct Config {
     pub max_clients_waiting_for_query: usize,
     pub hooks_basedir: Option<String>,
     pub hooks_socket_path: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+             server_type: ServerType::default(),
+             decrement_ttl: true,
+             upstream_servers_str: Vec::new(),
+             lbmode: LoadBalancingMode::default(),
+             upstream_max_failure_duration: Duration::from_millis(2500),
+             cache_size: 250_000,
+             udp_ports: 8,
+             listen_addr: "0.0.0.0:53".to_string(),
+             webservice_enabled: false,
+             webservice_listen_addr: "0.0.0.0:9090".to_string(),
+             min_ttl: 1,
+             max_ttl: 86_400,
+             user: None,
+             group: None,
+             chroot_dir: None,
+             udp_acceptor_threads: 1,
+             tcp_acceptor_threads: 1,
+             dnstap_enabled: false,
+             dnstap_backlog: 0,
+             dnstap_socket_path: None,
+             identity: None,
+             version: None,
+             max_tcp_clients: 250,
+             max_waiting_clients: 1_000_000,
+             max_active_queries: 100_000,
+             max_clients_waiting_for_query: 1_000,
+             hooks_basedir: None,
+             hooks_socket_path: None,
+        }
+    }
 }
 
 impl Config {

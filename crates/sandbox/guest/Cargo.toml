@@ -1,0 +1,14 @@
+[package]
+name = "guest"
+version = "0.1.0"
+authors = ["Marek Vavruša <mvavrusa@cloudflare.com>"]
+edition = "2018"
+
+[features]
+default = ["futures"]
+futures = ["futures-preview"]
+std = ["futures-preview/std"]
+
+[dependencies]
+futures-preview = { version = "=0.3.0-alpha.12", default-features = false, optional = true }
+embrio-async = {git = "https://github.com/Nemo157/embrio-rs", rev = "73853731f00b1babefe572fe8b339f188e1a17db"}

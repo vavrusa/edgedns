@@ -1,11 +1,12 @@
 [workspace]
 members = [
 	"crates/libedgedns", 
-	"crates/server"
+	"crates/server",
+	"crates/sandbox/runtime",
+	"crates/sandbox/guest",
 ]
 
 [profile.release]
-debug = true
 lto = true
 
 [profile.bench]

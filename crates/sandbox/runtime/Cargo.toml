@@ -1,0 +1,45 @@
+[package]
+name = "edgedns-sandbox-runtime"
+version = "0.1.0"
+authors = ["Marek Vavrusa <marek@vavrusa.com>"]
+publish = false
+edition = "2018"
+
+[features]
+jemalloc = ["jemallocator"]
+default = ["jemalloc"]
+
+[lib]
+name = "libedgedns_sandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "edgedns-sandbox-runtime"
+path = "src/main.rs"
+
+[dependencies]
+log = "*"
+clap = "*"
+env_logger = "^0.6"
+bytes = "*"
+futures = "*"
+tokio = {git = "https://github.com/tokio-rs/tokio", features=["async-await-preview"]}
+jemallocator = {version = "*", optional = true}
+parking_lot = {version = "0.7", features = ["nightly"]}
+lazy_static = "*"
+slab = "0.4"
+byteorder = "1"
+target-lexicon = { version = "0.2.0", default-features = false }
+cranelift-codegen = "0.28.0"
+cranelift-native = "0.28.0"
+cranelift-entity = "0.28.0"
+cranelift-wasm = "0.28.0"
+wasmtime-environ = { git = "https://github.com/vavrusa/wasmtime" }
+wasmtime-runtime = { git = "https://github.com/vavrusa/wasmtime" }
+wasmtime-jit = { git = "https://github.com/vavrusa/wasmtime" }
+wasmtime-obj = { git = "https://github.com/vavrusa/wasmtime" }
+wasmtime-wast = { git = "https://github.com/vavrusa/wasmtime" }
+wabt = "0.7"
+domain-core = {git = "https://github.com/vavrusa/domain-core"}
+guest = {path = "../guest", default-features = false}
+libedgedns = {path = "../../libedgedns"}

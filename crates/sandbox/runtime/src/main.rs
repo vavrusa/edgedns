@@ -7,20 +7,16 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use bytes::BytesMut;
 use clap::{App, Arg};
-use cranelift_codegen::settings;
-use cranelift_codegen::settings::Configurable;
 use domain_core::bits::*;
 use env_logger;
 use futures::future::Either;
 use libedgedns::{Cache, Conductor, Config, Context, Scope, Varz};
 use log::*;
-use parking_lot::{Mutex, RwLock};
-use std::cell::RefCell;
+use parking_lot::{Mutex};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::codec::BytesCodec;
@@ -28,8 +24,7 @@ use tokio::net::{UdpFramed, UdpSocket};
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::timer::Interval;
-use wasmtime_jit::{Compiler, Namespace, InstanceIndex};
-use libedgedns_sandbox::SharedState;
+use libedgedns_sandbox::{SharedState, CallError, Instance, instantiate};
 
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const PKG_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
@@ -82,34 +77,34 @@ fn main() {
         )
         .get_matches();
 
-    let wasm_file = matches.value_of("file").unwrap_or("main.wasm");
+    let wasm_file = matches.value_of("file").unwrap_or("main.wasm").to_owned();
 
-    let mut flag_builder = settings::builder();
-    if matches.is_present("verify") {
-        flag_builder.enable("enable_verifier").unwrap();
-    }
-    flag_builder
-        .set(
-            "opt_level",
-            matches.value_of("opt_level").unwrap_or("default"),
-        )
-        .unwrap();
+    // TODO(anb): support verify and opt_level
+    // let mut flag_builder = settings::builder();
+    // if matches.is_present("verify") {
+    //     flag_builder.enable("enable_verifier").unwrap();
+    // }
+    // flag_builder
+    //     .set(
+    //         "opt_level",
+    //         matches.value_of("opt_level").unwrap_or("default"),
+    //     )
+    //     .unwrap();
 
-    let isa_builder = cranelift_native::builder().unwrap_or_else(|_| {
-        panic!("host machine is not a supported target");
-    });
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+    // let isa_builder = cranelift_native::builder().unwrap_or_else(|_| {
+    //     panic!("host machine is not a supported target");
+    // });
+    // let isa = isa_builder.finish(settings::Flags::new(flag_builder));
     let context = runtime_context();
-    let shared_state = SharedState::new(context.clone(), Compiler::new(isa), Namespace::new());
-    let current_index : Arc<RwLock<Option<InstanceIndex>>> = Arc::new(RwLock::new(None));
+    let shared_state = SharedState::new(context.clone());
+    let module_ns = Arc::new(Mutex::new(HashMap::new()));
 
     // Run start function
     trace!("runtime start");
-    let file_reloader = file_reloader(wasm_file.to_string(), shared_state.clone(), current_index.clone());
+    let file_reloader = file_reloader(module_ns.clone(), wasm_file.to_string(), shared_state.clone());
 
     // Listen and process incoming messages
     if let Some(address) = matches.value_of("listen") {
-        let current_index = current_index.clone();
         let hook_disabled = matches.is_present("disable");
 
         info!("processing messages from {}", address);
@@ -118,9 +113,8 @@ fn main() {
         let fut = stream
             .and_then(move |(msg, from)| {
                 let shared_state = shared_state.clone();
-                let index = *current_index.read();
                 let scope = Scope::new(context.clone(), msg.clone().into(), from).expect("scope");
-                trace!("processing {} bytes from {}, instance: {:?}", msg.len(), from, index);
+                trace!("processing {} bytes from {}", msg.len(), from);
 
                 // Create a response builder
                 let answer = {
@@ -134,12 +128,13 @@ fn main() {
                 };
 
                 // Process message
-                if hook_disabled || index.is_none() {
+              let ns = module_ns.lock();
+              if hook_disabled || !ns.contains_key(&wasm_file) {
                     Either::A(future::ok((answer.into(), from)))
                 } else {
                     Either::B(
                         shared_state
-                            .invoke_hook(index.unwrap(), scope, answer.clone())
+                            .invoke_hook(ns.get(&wasm_file).unwrap().clone(), scope, answer.clone())
                             .then(move |res| {
                                 trace!("processed hook: {:?}", res);
                                 if let Ok((answer, _action)) = res {
@@ -166,10 +161,10 @@ fn main() {
     }
 }
 
-fn file_reloader(wasm_file: String, shared_state: SharedState, current_index: Arc<RwLock<Option<InstanceIndex>>>) -> impl Future<Item = (), Error = ()> {
+fn file_reloader(module_ns: Arc<Mutex<HashMap<String, Instance>>>, wasm_file: String, shared_state: SharedState) -> impl Future<Item = (), Error = ()> {
     let last_modified = Mutex::new(None);
     Interval::new_interval(Duration::from_millis(500))
-            .map_err(|_| io::ErrorKind::Other.into())
+            .map_err(|_| CallError::IO(io::ErrorKind::Other.into()))
             .filter_map(move |_| {
                 let metadata = std::fs::metadata(&wasm_file).unwrap();
                 let time = metadata.modified().unwrap();
@@ -183,13 +178,17 @@ fn file_reloader(wasm_file: String, shared_state: SharedState, current_index: Ar
                 }
             })
             .and_then(move |wasm_file| {
-                let global_exports = Rc::new(RefCell::new(HashMap::new()));
                 let data = read_to_end(wasm_file.clone().into()).unwrap();
                 let shared_state = shared_state.clone();
-                match shared_state.load(data, global_exports) {
-                    Ok(index) => {
-                        let scheduled = shared_state.invoke_start(index);
-                        *current_index.write() = Some(index);
+              // let import_objects = imports! {
+              // };
+              //match instantiate(&data, import_objects()) {
+              match instantiate(shared_state.clone(), &data) {
+                    Ok(instance) => {
+                        let mut ns = module_ns.lock();
+                        let i = Instance::new(instance);
+                        ns.insert(wasm_file, i.clone());
+                        let scheduled = shared_state.invoke_start(i.clone());
                         future::Either::A(scheduled)
                     },
                     Err(e) => {
@@ -199,7 +198,7 @@ fn file_reloader(wasm_file: String, shared_state: SharedState, current_index: Ar
                 }
             })
             .for_each(move |_| Ok(()))
-            .map_err(move |e| error!("when processing: {}", e))
+            .map_err(move |e| error!("when processing: {:?}", e))
 }
 
 fn runtime_context() -> Arc<Context> {

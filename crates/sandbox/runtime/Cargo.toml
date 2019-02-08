@@ -30,15 +30,7 @@ lazy_static = "*"
 slab = "0.4"
 byteorder = "1"
 target-lexicon = { version = "0.2.0", default-features = false }
-cranelift-codegen = "0.28.0"
-cranelift-native = "0.28.0"
-cranelift-entity = "0.28.0"
-cranelift-wasm = "0.28.0"
-wasmtime-environ = { git = "https://github.com/vavrusa/wasmtime" }
-wasmtime-runtime = { git = "https://github.com/vavrusa/wasmtime" }
-wasmtime-jit = { git = "https://github.com/vavrusa/wasmtime" }
-wasmtime-obj = { git = "https://github.com/vavrusa/wasmtime" }
-wasmtime-wast = { git = "https://github.com/vavrusa/wasmtime" }
 domain-core = {git = "https://github.com/vavrusa/domain-core", rev = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}
+wasmer-runtime = "0.1.2"
 guest = {path = "../guest", default-features = false}
 libedgedns = {path = "../../libedgedns"}

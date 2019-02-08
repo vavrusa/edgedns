@@ -5,6 +5,9 @@ members = [
 	"crates/sandbox/runtime",
 	"crates/sandbox/guest",
 ]
+exclude = [
+	"tests",
+]
 
 [profile.release]
 lto = true

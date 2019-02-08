@@ -32,25 +32,17 @@ pub extern "C" fn debug(vmctx: *mut VMContext, ptr: i32, len: i32) {
   }
 }
 
-pub extern "C" fn create_future(vmctx: *mut VMContext) -> i32 {
+pub extern "C" fn register_future(vmctx: *mut VMContext, data: i32, vtable_ptr: i32) -> i32 {
   let state: &mut SharedState = vmctx.into();
   let current_index = state.current().index.unwrap();
   let task_id = state.create_task(current_index);
-
-  // Schedule the task for execution immediately, the guest must provide a callback before it runs.
-  state.inner.scheduled_queue.lock().push(task_id as usize);
-  trace!("[{}] created future: {}", current_index, task_id);
-  task_id as i32
-}
-
-pub extern "C" fn register_future(vmctx: *mut VMContext, task_id: i32, data: i32, vtable_ptr: i32) -> i32 {
-  let state: &mut SharedState = vmctx.into();
-  let current_index = state.current().index.unwrap();
   match state.get_tasks_mut(current_index).get_mut(task_id as usize) {
     Some(ref mut fut) => {
       trace!("[{}] registered #{} callback: {}/{}", current_index, task_id, data, vtable_ptr);
       fut.cb = GuestCallback{ptr: (data, vtable_ptr)};
-      guest::from_result(Ok(0))
+      // Schedule the task for execution immediately
+      state.inner.scheduled_queue.lock().push(task_id as usize);
+      task_id as i32
     }
     None => {
       warn!("[{}] attempted to register invalid #{}", current_index, task_id);
@@ -329,27 +321,23 @@ pub fn local_socket_open(vmctx: *mut VMContext, ptr: i32, len: i32) -> i32 {
     return guest::Error::NotFound.into();
   }
 
-  trace!("[{}] connecting local stream {:?}", current_index, path);
+  // Create an empty buffer
   let task_id = state.create_task(current_index);
-  let src = GuestStream{host_state: state.clone(), index: current_index, task_handle:task_id};
-
-  // Create empty buffer
   if let Some(ref mut task) = state.get_tasks_mut(current_index).get_mut(task_id) {
-    task.data = Some(Vec::with_capacity(4096));
+    task.data = Some(Vec::with_capacity(8192));
   }
 
+  // Create a new task if not reconnecting
+  trace!("[{}] connecting local stream {:?}", current_index, path);
+  let src = GuestStream{host_state: state.clone(), index: current_index, task_handle: task_id};
+
   // Open connection to local socket, and connect guest stream to sink
-  let state = state.clone();
   tokio::spawn(UnixStream::connect(&path)
     .and_then(move |stream| {
       let (sink, _) = Framed::new(stream, BytesCodec::new()).split();
       src.forward(sink)
     })
     .then(move |res| {
-      // Close task if it's still pending (if sink closed first)
-      // if let Some(ref mut task) = state.get_tasks_mut(current_index).get_mut(task_id) {
-      //   task.closed = true;
-      // }
       // Log stream closure
       match res {
         Ok(_) => trace!("[{}] local stream {:?}, closed", current_index, task_id),
@@ -404,7 +392,7 @@ pub fn local_socket_send(vmctx: *mut VMContext, task_id: i32, ptr: i32, len: i32
         None => return guest::Error::PermissionDenied.into(),
       };
       // Flush when buffered enough data
-      if data.len() >= 1024 {
+      if data.len() >= 8192 {
         if let Some(waiting) = task.waiting.take() {
           waiting.notify();
         }
@@ -533,22 +521,7 @@ pub fn instantiate(state: SharedState) -> Result<Instance, InstantiationError> {
 
   let sig = module.signatures.push(translate_signature(
     ir::Signature {
-      params: vec![],
-      returns: vec![ir::AbiParam::new(types::I32)],
-      call_conv,
-    },
-    pointer_type,
-  ));
-  let func = module.functions.push(sig);
-  module
-    .exports
-    .insert("create_future".to_owned(), Export::Function(func));
-  finished_functions.push(create_future as *const VMFunctionBody);
-
-  let sig = module.signatures.push(translate_signature(
-    ir::Signature {
       params: vec![
-        ir::AbiParam::new(types::I32),
         ir::AbiParam::new(types::I32),
         ir::AbiParam::new(types::I32),
       ],

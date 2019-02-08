@@ -2,11 +2,9 @@ use crate::{host_calls, to_result, Action, Async, AsyncState, AsyncValue, Error}
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::rc::Rc;
 use core::fmt::Write;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicI32, Ordering};
 use futures::prelude::Future;
 use futures::task::{LocalWaker, Poll, UnsafeWake, Waker};
 
@@ -200,65 +198,50 @@ impl<'a> Future for Forward<'a> {
     }
 }
 
-/// Stream connected to a local endpoint (e.g. local socket).
-#[derive(Clone)]
-pub struct LocalStream {
-    task_id: Rc<AtomicI32>,
+/// Typed task handle for stream.
+struct StreamHandle (i32);
+
+impl StreamHandle {
+    /// Ask host for a connected stream to local endpoint.
+    pub fn new(path: &str) -> Result<Self, Error> {
+        match to_result(unsafe { host_calls::privileged::local_socket_open(path.as_ptr(), path.len() as i32) }) {
+            Ok(fd) => Ok(Self(fd)),
+            Err(e) => Err(e),
+        }
+    }
 }
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        unsafe { host_calls::privileged::local_socket_close(self.0); }
+    }
+}
+
+/// Stream connected to a local endpoint (e.g. local socket).
+pub struct LocalStream {
+    task: StreamHandle
+} 
 
 impl LocalStream {
     /// Create an unconnected stream.
-    pub fn new() -> Self {
-        Self {
-            task_id: Rc::new(AtomicI32::new(-1))
+    pub fn new(path: &str) -> Result<Self, Error> {
+        match StreamHandle::new(path) {
+            Ok(task) => Ok(Self { task }),
+            Err(e) => Err(e),
         }
-    }
-
-    /// Check if the local stream is connected.
-    pub fn is_connected(&self) -> bool {
-        self.task_id.load(Ordering::Relaxed) >= 0
     }
 
     /// Ask host for a connected stream to local endpoint.
     pub fn connect(path: &str) -> Result<LocalStream, Error> {
-        match to_result(unsafe { host_calls::privileged::local_socket_open(path.as_ptr(), path.len() as i32) }) {
-            Ok(task_id) => Ok(Self{task_id: Rc::new(AtomicI32::new(task_id))}),
-            Err(e) => Err(e),
+        match StreamHandle::new(path) {
+            Ok(task) => Ok(Self{task}),
+            Err(e) => Err(e)
         }
-    }
-
-    /// Attempt to reconnect the stream.
-    pub fn reconnect(&mut self, path: &str) -> Result<(), Error> {
-        let new_task_id = match to_result(unsafe { host_calls::privileged::local_socket_open(path.as_ptr(), path.len() as i32) }) {
-            Ok(task_id) => task_id,
-            Err(e) => return Err(e),
-        };
-
-        // Swap and close old task if sensible
-        let old_task_id = self.task_id.swap(new_task_id, Ordering::Relaxed);
-        if old_task_id >= 0 {
-            unsafe { host_calls::privileged::local_socket_close(old_task_id); }
-        }
-
-        Ok(())
     }
 
     /// Poll state of the local stream.
     pub fn poll_state(&self) -> Result<(), Error> {
-        let task_id = self.task_id.load(Ordering::Relaxed);
-        match to_result(unsafe { host_calls::privileged::local_socket_send(task_id, core::ptr::null(), 0) }) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Shutdown current stream, it will not be readable or writeable anymore.
-    pub fn shutdown(&mut self) -> Result<(), Error> {
-        let task_id = self.task_id.swap(-1, Ordering::Relaxed);
-        if task_id < 0 {
-            return Err(Error::NotFound);
-        }
-        match to_result(unsafe { host_calls::privileged::local_socket_close(task_id) }) {
+        match to_result(unsafe { host_calls::privileged::local_socket_send(self.task.0, core::ptr::null(), 0) }) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -271,9 +254,8 @@ use futures::io::{self, AsyncWrite};
 #[cfg(feature = "std")]
 impl AsyncWrite for LocalStream {
     fn poll_write(&mut self, _lw: &LocalWaker, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let task_id = self.task_id.load(Ordering::Relaxed);
         // TODO: split buffer into maximum chunks of 64K as only u16 can be transferred at a time
-        match to_result(unsafe { host_calls::privileged::local_socket_send(task_id, buf.as_ptr(), buf.len() as i32) }) {
+        match to_result(unsafe { host_calls::privileged::local_socket_send(self.task.0, buf.as_ptr(), buf.len() as i32) }) {
             Ok(v) => {
                 if v == 0 {
                     Poll::Pending
@@ -290,7 +272,12 @@ impl AsyncWrite for LocalStream {
     }
 
     fn poll_close(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
-        Poll::Ready(self.shutdown().map_err(move |e| io::ErrorKind::Other.into()))
+        let state = match to_result(unsafe { host_calls::privileged::local_socket_close(self.task.0) }) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(io::ErrorKind::Other.into()),
+        };
+
+        Poll::Ready(state)
     }
 }
 
@@ -330,15 +317,14 @@ fn schedule_future<I: Into<AsyncValue> + 'static>(
         _ => {}
     }
 
-    let task_id = match to_result(unsafe { host_calls::create_future() }) {
-        Ok(task_id) => task_id,
-        Err(e) => return Async::Error(e),
-    };
-
-    let closure = Box::new(move || poll_future(&mut future).into());
-    match to_result(unsafe { host_calls::register_future(task_id, Box::into_raw(closure)) }) {
+    let closure = Box::into_raw(Box::new(move || poll_future(&mut future).into()));
+    match to_result(unsafe { host_calls::register_future(closure) }) {
         Ok(_) => Async::NotReady,
-        Err(e) => Async::Error(e),
+        Err(e) => {
+            // Free the unregistered closure
+            let _ = unsafe { Box::from_raw(closure) };
+            Async::Error(e)
+        },
     }
 }
 

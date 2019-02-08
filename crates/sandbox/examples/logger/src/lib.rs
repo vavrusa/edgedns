@@ -7,6 +7,8 @@ static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
 use futures::io::AsyncWriteExt;
 use guest::{self, async_block, await, Action, Delay, LocalStream};
+use std::rc::Rc;
+use std::sync::Mutex;
 
 // Include generated schema bindings
 use byteorder::{ByteOrder, LittleEndian};
@@ -19,37 +21,49 @@ mod schema_capnp {
 
 #[no_mangle]
 pub extern "C" fn run() {
-    let stream = LocalStream::new();
+    let stream = Rc::new(Mutex::new(None));
 
     // Watch the open connection
     drop(watch_local_socket(stream.clone()));
 
     // Serialize log for each message and write it to the stream
     guest::for_each_message(move |mut req| {
-        let mut stream = stream.clone();
+        let stream = stream.clone();
         async_block! {
-            // Check if the stream is open
-            if !stream.is_connected() {
-                return Ok(Action::Pass);
-            }
+            let mut guard = stream.lock().unwrap();
+            let stream = match &mut *guard {
+                Some(ref mut stream) => stream,
+                None => return Ok(Action::Pass),
+            };
 
             let msg = build_message(&mut req);
 
             // Serialize segment table
             let segments = &*msg.get_segments_for_output();
-            if segments.len() == 1 {
-                let mut buf = [0; 8];
-                LittleEndian::write_u32(&mut buf[4..8], segments[0].len() as u32);
-                drop(await!(stream.write_all(&buf)));
-            } else {
-                let buf = construct_segment_table(segments);
-                drop(await!(stream.write_all(&buf)));
-            }
+            let res = match segments.len() {
+                1 => {
+                    let mut buf = [0; 8];
+                    LittleEndian::write_u32(&mut buf[4..8], segments[0].len() as u32);
+                    await!(stream.write_all(&buf))
+                },
+                _ => {
+                    let buf = construct_segment_table(segments);
+                    await!(stream.write_all(&buf))
+                }
+            };
 
             // Serialize segments
-            for i in 0..segments.len() {
-                let buf = capnp::Word::words_to_bytes(segments[i]);
-                drop(await!(stream.write_all(buf)));
+            match res {
+                Ok(_) => {
+                    for i in 0..segments.len() {
+                        let buf = capnp::Word::words_to_bytes(segments[i]);
+                        drop(await!(stream.write_all(buf)));
+                    }
+                },
+                Err(_) => {
+                    // Close on write error
+                    *guard = None;
+                }
             }
 
             Ok(Action::Pass)
@@ -57,12 +71,16 @@ pub extern "C" fn run() {
     });
 }
 
-fn watch_local_socket(mut stream: LocalStream) -> Result<(), guest::Error> {
+fn watch_local_socket(stream: Rc<Mutex<Option<LocalStream>>>) -> Result<(), guest::Error> {
     guest::spawn(async_block! {
         while await!(Delay::from_millis(5_000)).is_ok() {
             // Attempt to reconnect if errored out
-            if stream.poll_state().is_err() {
-                drop(stream.reconnect("test.sock"));
+            let mut guard = stream.lock().unwrap();
+            if guard.is_none() {
+                match LocalStream::new("test.sock") {
+                    Ok(stream) => { guard.replace(stream); },
+                    Err(e) => {},
+                }
             }
         }
         Ok(())

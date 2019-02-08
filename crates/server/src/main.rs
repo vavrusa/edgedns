@@ -40,7 +40,6 @@ fn main() {
                 .value_name("FILE")
                 .help("Path to the edgedns.toml config file")
                 .takes_value(true)
-                .required(true),
         )
         .get_matches();
 

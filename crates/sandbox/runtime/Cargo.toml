@@ -23,7 +23,7 @@ clap = "*"
 env_logger = "^0.6"
 bytes = "*"
 futures = "*"
-tokio = {git = "https://github.com/tokio-rs/tokio", features=["async-await-preview"]}
+tokio = {version = "0.1.15", features=["async-await-preview"]}
 jemallocator = {version = "*", optional = true}
 parking_lot = {version = "0.7", features = ["nightly"]}
 lazy_static = "*"
@@ -39,7 +39,6 @@ wasmtime-runtime = { git = "https://github.com/vavrusa/wasmtime" }
 wasmtime-jit = { git = "https://github.com/vavrusa/wasmtime" }
 wasmtime-obj = { git = "https://github.com/vavrusa/wasmtime" }
 wasmtime-wast = { git = "https://github.com/vavrusa/wasmtime" }
-wabt = "0.7"
-domain-core = {git = "https://github.com/vavrusa/domain-core"}
+domain-core = {git = "https://github.com/vavrusa/domain-core", rev = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}
 guest = {path = "../guest", default-features = false}
 libedgedns = {path = "../../libedgedns"}

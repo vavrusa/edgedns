@@ -3,11 +3,12 @@ use hyper::rt::Future;
 use hyper::service::service_fn_ok;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use libedgedns::Context;
+use log::*;
 use prometheus;
 use prometheus::{Encoder, TextEncoder};
 use std::sync::Arc;
+use stream_cancel::Tripwire;
 use tokio::executor::DefaultExecutor;
-use stream_cancel::{StreamExt, Tripwire};
 
 #[derive(Clone)]
 pub struct WebService {}
@@ -78,11 +79,12 @@ impl WebService {
         let server = Server::bind(&listen_addr)
             .executor(DefaultExecutor::current())
             .serve(new_service)
-            .take_while(tripwire)
+            .with_graceful_shutdown(tripwire)
             .map_err(|e| eprintln!("server error: {}", e));
 
         tokio::spawn(server.then(|_| {
             info!("webserver done");
+            Ok(())
         }));
     }
 }

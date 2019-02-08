@@ -8,7 +8,7 @@ edition = "2018"
 [features]
 jemalloc = ["jemallocator"]
 webservice = ["hyper"]
-default = ["jemalloc"]
+default = ["jemalloc", "webservice"]
 
 [[bin]]
 name = "edgedns"

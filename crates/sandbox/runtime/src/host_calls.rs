@@ -262,7 +262,7 @@ pub fn request_query_name(vmctx: *mut VMContext, request: i32, ptr: i32, max_len
     // Copy the query name
     match state.inspect_memory_mut(ptr as usize, max_len as usize) {
       Ok(s) => {
-        s[..qname_len].copy_from_slice(qname.as_flat_slice().expect("domain"));
+        s[..qname_len].copy_from_slice(&qname.clone().into_bytes());
         guest::from_result(Ok(qname_len as i32))
       }
       Err(_e) => guest::Error::InvalidInput.into(),

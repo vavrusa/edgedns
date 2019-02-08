@@ -12,4 +12,3 @@ lto = true
 [profile.bench]
 debug = true
 panic = 'abort'
-incremental = true

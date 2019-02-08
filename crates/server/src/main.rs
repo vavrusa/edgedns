@@ -10,11 +10,12 @@ use coarsetime::Instant;
 use env_logger;
 use libedgedns::{Cache, Conductor, Config, Context, TcpServer, UdpServer, Varz};
 use log::*;
-use tokio::prelude::*;
-use tokio::timer::Interval;
-
 use std::sync::Arc;
 use std::time::Duration;
+use stream_cancel::{StreamExt, Tripwire};
+use tokio::prelude::*;
+use tokio::timer::Interval;
+use tokio_signal;
 
 #[cfg(feature = "webservice")]
 mod webservice;
@@ -63,35 +64,49 @@ fn main() {
 
     tokio::run_async(
         async move {
+            let conductor = Arc::new(Conductor::from(&config));
+            let cache = Cache::new(&config, varz.clone());
+            let context = Context::new(config.clone(), conductor, cache, varz.clone());
+
+            // Graceful shutdown trigger
+            let (trigger, tripwire) = Tripwire::new();
+            let ctrl_c = tokio_signal::ctrl_c()
+                .flatten_stream()
+                .into_future()
+                .then(move |_| {
+                    info!("shutdown initiated");
+                    drop(trigger);
+                    Ok(())
+                });
+            tokio::spawn(ctrl_c);
+
             // Update coarsetime internal timestamp regularly
             tokio::spawn(
                 Interval::new_interval(Duration::from_millis(CLOCK_RESOLUTION))
+                    .take_until(tripwire.clone())
                     .for_each(move |_| {
                         Instant::update();
+                        varz.update_uptime();
                         Ok(())
                     })
                     .map_err(|e| eprintln!("failed to update time: {}", e)),
             );
 
-            let conductor = Arc::new(Conductor::from(&config));
-            let cache = Cache::new(&config, varz.clone());
-            let context = Context::new(config.clone(), conductor, cache, varz);
-
             // Start UDP acceptors
             let server = UdpServer::new(context.clone(), config.max_active_queries);
-            if let Err(e) = server.spawn() {
+            if let Err(e) = server.spawn(tripwire.clone()) {
                 error!("error whilst starting a UDP server: {:?}", e)
             }
 
             // Start TCP acceptors
             let server = TcpServer::new(context.clone(), config.max_active_queries);
-            if let Err(e) = server.spawn() {
+            if let Err(e) = server.spawn(tripwire.clone()) {
                 error!("error whilst starting a TCP server: {:?}", e)
             }
 
             // Start the optional webservice
             #[cfg(feature = "webservice")]
-            webservice::WebService::spawn(context.clone());
-        },
+            webservice::WebService::spawn(context.clone(), tripwire.clone());
+        }
     );
 }

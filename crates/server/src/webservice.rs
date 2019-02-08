@@ -7,12 +7,13 @@ use prometheus;
 use prometheus::{Encoder, TextEncoder};
 use std::sync::Arc;
 use tokio::executor::DefaultExecutor;
+use stream_cancel::{StreamExt, Tripwire};
 
 #[derive(Clone)]
 pub struct WebService {}
 
 impl WebService {
-    pub fn spawn(context: Arc<Context>) {
+    pub fn spawn(context: Arc<Context>, tripwire: Tripwire) {
         let config = &context.config;
         if !config.webservice_enabled {
             return;
@@ -77,8 +78,11 @@ impl WebService {
         let server = Server::bind(&listen_addr)
             .executor(DefaultExecutor::current())
             .serve(new_service)
+            .take_while(tripwire)
             .map_err(|e| eprintln!("server error: {}", e));
 
-        tokio::spawn(server);
+        tokio::spawn(server.then(|_| {
+            info!("webserver done");
+        }));
     }
 }

@@ -25,6 +25,7 @@ pub struct Scope {
     pub question: Question<ParsedDname>,
     pub peer_addr: SocketAddr,
     pub context: Arc<Context>,
+    protocol: Protocol,
 }
 
 impl Scope {
@@ -36,9 +37,20 @@ impl Scope {
                 question,
                 peer_addr,
                 context,
+                protocol: Protocol::default(),
             }),
             None => Err(ErrorKind::UnexpectedEof.into()),
         }
+    }
+
+    /// Set transport protocol used in this scope
+    pub fn set_protocol(&mut self, protocol: Protocol) {
+        self.protocol = protocol;
+    }
+
+    /// Get OPT record from client query
+    pub fn opt(&self) -> Option<opt::OptRecord> {
+        self.query.opt()
     }
 }
 

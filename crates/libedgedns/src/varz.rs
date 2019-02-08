@@ -48,13 +48,13 @@ impl Inner {
             ))
             .unwrap(),
             cache_hits: register_gauge!(opts!(
-                "cache_hits",
+                "edgedns_cache_hits",
                 "Number of cache lookup hits",
                 labels! {"handler" => "all",}
             ))
             .unwrap(),
             cache_misses: register_gauge!(opts!(
-                "cache_misses",
+                "edgedns_cache_misses",
                 "Number of cache lookup misses",
                 labels! {"handler" => "all",}
             ))
@@ -183,6 +183,13 @@ impl Inner {
             ))
             .unwrap(),
         }
+    }
+
+    /// Update server uptime metric.
+    pub fn update_uptime(&self) {
+        let StartInstant(start_instant) = self.start_instant;
+        let uptime = start_instant.elapsed().as_secs();
+        self.uptime.set(uptime as f64);
     }
 }
 

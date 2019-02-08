@@ -20,11 +20,12 @@ coarsetime = "*"
 rand = "^0.6"
 toml = "*"
 bytes = "*"
+stream-cancel = "0.4"
 jumphash = {git = "https://github.com/jedisct1/rust-jumphash"}
-tokio = {git = "https://github.com/tokio-rs/tokio", features=["async-await-preview"]}
-domain-core = {git = "https://github.com/vavrusa/domain-core"}
-kres = {git = "https://github.com/vavrusa/rust-kres", features=["static"]}
-parking_lot = {version = "0.6", features = ["nightly"]}
+tokio = {version = "0.1.15", features=["async-await-preview"]}
+domain-core = {git = "https://github.com/vavrusa/domain-core", ref = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}
+kres = {git = "https://github.com/vavrusa/rust-kres"}
+parking_lot = {version = "0.7"}
 clockpro-cache = {git = "https://github.com/jedisct1/rust-clockpro-cache"}
 prometheus = "*"
 hex = "0.3"

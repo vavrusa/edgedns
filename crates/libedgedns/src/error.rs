@@ -51,7 +51,7 @@ impl From<io::Error> for Error {
 
 impl From<io::ErrorKind> for Error {
     fn from(e: io::ErrorKind) -> Error {
-        e.into()
+        Error::Io(io::Error::new(e, ""))
     }
 }
 
@@ -63,13 +63,11 @@ impl From<net::AddrParseError> for Error {
 
 impl <T: StdError> From<timer::timeout::Error<T>> for Error {
     fn from(e: timer::timeout::Error<T>) -> Error {
-        let err = if e.is_elapsed() {
-        	io::ErrorKind::TimedOut.into()
+        if e.is_elapsed() {
+        	Error::from(io::ErrorKind::TimedOut)
         } else {
-        	io::Error::new(io::ErrorKind::Other, e.description())
-        };
-
-        err.into()
+        	Error::from(io::Error::new(io::ErrorKind::Other, e.description()))
+        }
     }
 }
 

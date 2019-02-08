@@ -15,17 +15,19 @@ name = "edgedns"
 path = "src/main.rs"
 
 [dependencies]
-log = "*"
-clap = "*"
-socket2 = {version = "*", features = ["reuseport"]}
-env_logger = "^0.6"
 bytes = "*"
-futures = "*"
+clap = "*"
 clippy = {version = "*", optional = true}
-tokio = {git = "https://github.com/tokio-rs/tokio", features=["async-await-preview"]}
-libedgedns = {version = "0.4.0", path = "../libedgedns"}
-jemallocator = {version = "*", optional = true}
-hyper = {version = "0.12", optional = true}
-mime = "*"
 coarsetime = "*"
+env_logger = "^0.6"
+futures = "*"
+hyper = {version = "0.12", optional = true}
+jemallocator = {version = "*", optional = true}
+libedgedns = {version = "0.4.0", path = "../libedgedns"}
+log = "*"
+mime = "*"
 prometheus = "*"
+socket2 = {version = "*", features = ["reuseport"]}
+stream-cancel = "0.4"
+tokio = {version = "0.1.15", features=["async-await-preview"]}
+tokio-signal = "0.2"

@@ -18,6 +18,7 @@
 
 use crate::config::Config;
 use crate::varz::Varz;
+use crate::query_router::Scope;
 use bytes::Bytes;
 use clockpro_cache::*;
 use coarsetime::{Duration, Instant};
@@ -44,6 +45,7 @@ const CACHE_DEFAULT_TTL: u32 = 5;
 pub struct CacheKey {
     qname: Dname,
     qtype: Rtype,
+    dnssec: bool,
 }
 
 impl Default for CacheKey {
@@ -51,26 +53,18 @@ impl Default for CacheKey {
         Self {
             qname: Dname::root(),
             qtype: Rtype::Null,
+            dnssec: false,
         }
     }
 }
 
-impl From<(&Dname, Rtype, Class)> for CacheKey {
-    fn from((name, qtype, qclass): (&Dname, Rtype, Class)) -> Self {
+impl From<(&Dname, Rtype, Class, bool)> for CacheKey {
+    fn from((name, qtype, qclass, dnssec): (&Dname, Rtype, Class, bool)) -> Self {
         debug_assert_eq!(qclass, Class::In);
         Self {
             qname: name.clone(),
             qtype,
-        }
-    }
-}
-
-impl From<&Question<ParsedDname>> for CacheKey {
-    fn from(q: &Question<ParsedDname>) -> Self {
-        debug_assert_eq!(q.qclass(), Class::In);
-        Self {
-            qname: q.qname().to_name(),
-            qtype: q.qtype(),
+            dnssec,
         }
     }
 }
@@ -78,8 +72,29 @@ impl From<&Question<ParsedDname>> for CacheKey {
 impl From<&Message> for CacheKey {
     fn from(msg: &Message) -> Self {
         match msg.first_question() {
-            Some(ref q) => q.into(),
+            Some(ref q) => Self {
+                qname: q.qname().to_name(),
+                qtype: q.qtype(),
+                dnssec: match msg.opt() {
+                    Some(opt) => opt.dnssec_ok(),
+                    None => false
+                },
+            },
             None => Self::default(),
+        }
+    }
+}
+
+impl From<&Scope> for CacheKey {
+    fn from(scope: &Scope) -> Self {
+        let q = &scope.question;
+        Self {
+            qname: q.qname().to_name(),
+            qtype: q.qtype(),
+            dnssec: match scope.opt() {
+                Some(opt) => opt.dnssec_ok(),
+                None => false
+            },
         }
     }
 }
@@ -258,7 +273,7 @@ mod test {
     fn get_normal_1k(b: &mut Bencher) {
         let keys: Vec<_> = DOMAINS
             .iter()
-            .map(|dname| CacheKey::from((dname, Rtype::A, Class::In)))
+            .map(|dname| CacheKey::from((dname, Rtype::A, Class::In, false)))
             .collect();
         let key_count = keys.len();
         let mut config = Config::default();

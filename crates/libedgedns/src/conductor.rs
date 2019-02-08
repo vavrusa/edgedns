@@ -23,7 +23,7 @@ use tokio::reactor::Handle;
 /// Default connection concurrency (number of outstanding requests for single connection)
 const DEFAULT_CONNECTION_CONCURRENCY: usize = 1000;
 /// Default timeout for message exchange
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Default keepalive interval for idle connections
 const DEFAULT_KEEPALIVE: Duration = Duration::from_millis(10_000);
 
@@ -122,7 +122,7 @@ impl PendingQueries {
 
     /// Send the message to the queue of futures waiting for completion, and clear the message from the wait list.
     pub fn finish(&self, resp: &Message, peer_addr: &SocketAddr) -> usize {
-        let key = resp.into();
+        let key = CacheKey::from(resp);
         let mut locked = self.inner.write();
         match locked.remove(&key) {
             Some(sinks) => {
@@ -278,11 +278,12 @@ impl Exchanger for TcpExchanger {
         // First try to find an open connection that can be reused.
         // If there's no open connection, or it doesn't produce a response
         // within a reasonable time, then continue.
+        let num_choices = selection.len();
         match self.timetable.find_open_connection(selection) {
             Some(sink) => {
                 let pending = self.timetable.pending.clone();
                 Box::new(
-                    exchange_with_open_connection(sink, query.clone())
+                    exchange_with_open_connection(sink, query.clone(), num_choices)
                         .and_then(move |(message, peer_addr)| {
                             pending.finish(&message, &peer_addr);
                             Ok(())
@@ -559,6 +560,7 @@ fn keep_open_connection(
 fn exchange_with_open_connection(
     sink: ConnectionSender,
     query: Message,
+    num_choices: usize,
 ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
     let (tx, rx) = oneshot::channel();
     sink.send((query, tx))
@@ -570,7 +572,12 @@ fn exchange_with_open_connection(
             )
         })
         .and_then(move |_| {
-            let timeout = DEFAULT_TIMEOUT / 2;
+            // If the conductor has more address choices, wait for shorter time
+            // to allow retry over a new connection to another address.
+            let timeout = match num_choices {
+                1 => DEFAULT_TIMEOUT,
+                _ => DEFAULT_TIMEOUT / 2,
+            };
             rx.into_future().timeout(timeout).map_err(move |e| {
                 warn!(
                     "waited for {:#?}, but did not receive response: {}",

@@ -1,4 +1,3 @@
-use crate::cache::CacheKey;
 use crate::conductor::Origin;
 use crate::config::Config;
 use crate::query_router::Scope;
@@ -123,8 +122,8 @@ impl Recursor {
                                     let state = match res {
                                         Ok((message, from)) => {
                                             debug!(
-                                                "received response for '{}'",
-                                                CacheKey::from(&message)
+                                                "received response for '{:?}'",
+                                                message.first_question()
                                             );
                                             request.consume(message.as_slice(), from)
                                         }

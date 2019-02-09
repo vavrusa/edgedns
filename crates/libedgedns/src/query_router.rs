@@ -8,7 +8,7 @@ use crate::server::Protocol;
 use bytes::{Bytes, BytesMut};
 use domain_core::bits::*;
 use domain_core::iana::{Class, Rcode, Rtype};
-use domain_core::rdata::Txt;
+use domain_core::rdata::{AllRecordData, Txt};
 use lazy_static::*;
 use log::*;
 use std::io::ErrorKind;
@@ -192,7 +192,7 @@ fn resolve_from_answer(scope: &Scope, source: Message, answer: BytesMut, elapsed
         }
 
         // Skip the unparseable records
-        if let Ok(Some(mut rr)) = rr.into_record::<UnknownRecordData>() {
+        if let Ok(Some(mut rr)) = rr.into_record::<AllRecordData<ParsedDname>>() {
             // Decay TTL if configured
             if elapsed.is_some() && server_type != ServerType::Authoritative {
                 rr.set_ttl(rr.ttl().saturating_sub(elapsed.unwrap()));    

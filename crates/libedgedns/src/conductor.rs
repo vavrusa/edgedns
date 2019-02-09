@@ -107,7 +107,7 @@ impl PendingQueries {
             Some(v) => {
                 // If the queue is longer than the maximum of clients waiting, recycle an oldest waiting client
                 // The oldest waiting client is at the position 1 (the client executing the query is on position 0)
-                if v.len() >= self.max_clients_waiting {
+                if self.max_clients_waiting > 0 && v.len() >= self.max_clients_waiting {
                     v.remove(1);
                 }
                 v.push(sink);
@@ -202,7 +202,7 @@ impl Conductor {
                                 varz.upstream_response_sizes.observe(msg.len() as f64);
                                 varz.upstream_received.inc();
                                 Ok((msg, from))
-                            },
+                            }
                             Err(e) => {
                                 varz.upstream_timeout.inc();
                                 pending.clear(&key);
@@ -308,7 +308,7 @@ impl Exchanger for TcpExchanger {
                             varz.upstream_reused.inc();
                             Ok(())
                         })
-                        .or_else(move |_| try_selection)
+                        .or_else(move |_| try_selection),
                 )
             }
             None => Box::new(try_selection),

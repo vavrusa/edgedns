@@ -10,6 +10,7 @@ use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
+use log::*;
 use toml;
 
 /// EdgeDNS server type definition.
@@ -294,6 +295,10 @@ impl Config {
                 x.as_integer()
                     .expect("global.max_clients_waiting_for_query must be an integer")
             }) as usize;
+
+        if max_clients_waiting_for_query == 0 {
+            warn!("configured with unbounded number of clients waiting for query, default: {}", 1_000);
+        }
 
         let identity = config_global.and_then(|x| x.get("identity")).map(|x| {
             x.as_str()

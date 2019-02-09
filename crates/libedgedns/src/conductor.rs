@@ -9,13 +9,14 @@ use futures::sync::{mpsc, oneshot};
 use log::*;
 use parking_lot::RwLock;
 use socket2::{Domain, Socket, Type};
+use std::cmp;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
 use std::slice::Iter;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{tcp, TcpStream, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
@@ -62,24 +63,38 @@ struct Timetable {
 
 impl Timetable {
     /// Returns an open connection for an address from the given list (if exists).
-    fn find_open_connection(&self, addresses: &[SocketAddr]) -> Option<ConnectionSender> {
+    fn find_open_connection(&self, addresses: &[SocketAddr]) -> Option<ConnectionTracker> {
         let connections = self.connections.read();
         for addr in addresses {
-            if let Some(sink) = connections.get(addr) {
-                return Some(sink.clone());
+            if let Some(c) = connections.get(addr) {
+                return Some(c.clone());
             }
         }
 
         None
     }
 
+    /// Update counters and RTT for an open connection.
+    fn update_open_connection(&self, address: &SocketAddr, rtt: Duration) {
+        if let Some(ref mut c) = self.connections.write().get_mut(address) {
+            c.update(rtt);
+        }
+    }
+
     /// Add an open connection to the timetable.
-    fn add_open_connection(&self, address: SocketAddr, sink: ConnectionSender) {
-        self.connections.write().insert(address, sink);
+    fn add_open_connection(
+        &self,
+        address: SocketAddr,
+        sink: ConnectionSender,
+        expected_rtt: Duration,
+    ) {
+        self.connections
+            .write()
+            .insert(address, ConnectionTracker::new(sink, expected_rtt));
     }
 
     /// Removes an open connection for given address from the timetable.
-    fn remove_open_connection(&self, address: &SocketAddr) -> Option<ConnectionSender> {
+    fn remove_open_connection(&self, address: &SocketAddr) -> Option<ConnectionTracker> {
         self.connections.write().remove(address)
     }
 }
@@ -150,8 +165,42 @@ impl PendingQueries {
 type ResponseSender = oneshot::Sender<(Message, SocketAddr)>;
 type ConnectionSender = mpsc::Sender<(Message, ResponseSender)>;
 
+/// Established connection tracker.
+#[derive(Clone)]
+struct ConnectionTracker {
+    sender: ConnectionSender,
+    messages: u64,
+    total_rtt: u64,
+}
+
+impl ConnectionTracker {
+    fn new(sender: ConnectionSender, rtt: Duration) -> Self {
+        Self {
+            sender,
+            messages: 1,
+            total_rtt: Self::round_to_millis(rtt),
+        }
+    }
+
+    /// Çalculate mean RTT from observed messages.
+    fn mean_rtt(&self) -> Duration {
+        Duration::from_millis(self.total_rtt / self.messages)
+    }
+
+    /// Update connection tracker message count and
+    fn update(&mut self, rtt: Duration) {
+        self.messages += 1;
+        self.total_rtt += Self::round_to_millis(rtt);
+    }
+
+    /// Round duration to milliseconds and cap at 30 seconds.
+    fn round_to_millis(d: Duration) -> u64 {
+        cmp::min(d.as_secs(), 30) * 1000 + d.subsec_millis() as u64
+    }
+}
+
 /// Maps addresses of established connections to their message queues (sinks).
-type EstablishedConnections = RwLock<HashMap<SocketAddr, ConnectionSender>>;
+type EstablishedConnections = RwLock<HashMap<SocketAddr, ConnectionTracker>>;
 
 /// The conductor schedules outgoing queries identified by message, and an origin.
 /// It doesn't implement any specific outgoing connection protocol, and is used to provide
@@ -246,8 +295,9 @@ impl Exchanger for TcpExchanger {
             .and_then(move |addr| {
                 varz.upstream_sent.inc();
                 // Attempt to do a message exchange
+                let duration = Instant::now();
                 exchange_with_tcp(&addr, query_clone.clone()).then(move |res| match res {
-                    Ok((message, stream)) => Ok(Some((message, stream))),
+                    Ok((message, stream)) => Ok(Some((message, stream, duration.elapsed()))),
                     Err(e) => {
                         info!("error while talking to {}: {}", addr, e);
                         Ok(None)
@@ -260,7 +310,7 @@ impl Exchanger for TcpExchanger {
             .take(1)
             // Finish the in-flight query
             .fold(0, move |acc, res| {
-                if let Some((message, mut stream)) = res {
+                if let Some((message, mut stream, elapsed)) = res {
                     let peer_addr = stream
                         .get_ref()
                         .peer_addr()
@@ -272,6 +322,7 @@ impl Exchanger for TcpExchanger {
                             exchanger.timetable.clone(),
                             stream,
                             exchanger.connection_concurrency,
+                            elapsed,
                         ));
                     // Close connection as early as possible if not
                     } else if let Err(e) = stream.close() {
@@ -294,17 +345,19 @@ impl Exchanger for TcpExchanger {
         // First try to find an open connection that can be reused.
         // If there's no open connection, or it doesn't produce a response
         // within a reasonable time, then continue.
-        let num_choices = selection.len();
         match self.timetable.find_open_connection(selection) {
             Some(sink) => {
+                // Update metrics for reused connection attempt
                 let varz = scope.context.varz.clone();
                 varz.upstream_sent.inc();
-
-                let pending = self.timetable.pending.clone();
+                // Try to do message exchange
+                let started = Instant::now();
+                let timetable = self.timetable.clone();
                 Box::new(
-                    exchange_with_open_connection(sink, query.clone(), num_choices)
+                    exchange_with_open_connection(sink, query.clone())
                         .and_then(move |(message, peer_addr)| {
-                            pending.finish(&message, &peer_addr);
+                            timetable.update_open_connection(&peer_addr, started.elapsed());
+                            timetable.pending.finish(&message, &peer_addr);
                             varz.upstream_reused.inc();
                             Ok(())
                         })
@@ -502,6 +555,7 @@ fn keep_open_connection(
     timetable: Timetable,
     stream: FramedStream,
     concurrency: usize,
+    expected_rtt: Duration,
 ) -> impl Future<Item = (), Error = ()> {
     // Save connection in pending queue
     let peer_addr = stream
@@ -510,7 +564,7 @@ fn keep_open_connection(
         .expect("tcp connection must have a peer address");
 
     let (sender, receiver) = mpsc::channel(concurrency);
-    timetable.add_open_connection(peer_addr, sender);
+    timetable.add_open_connection(peer_addr, sender, expected_rtt);
 
     // Create a token bucket with channel to limit concurrency of the connection
     // In order to start new queries, there must be a token in the channel.
@@ -580,12 +634,13 @@ fn keep_open_connection(
 
 /// Returns a future that tries to perform a message exchange over an established connection.
 fn exchange_with_open_connection(
-    sink: ConnectionSender,
+    connection: ConnectionTracker,
     query: Message,
-    num_choices: usize,
 ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
     let (tx, rx) = oneshot::channel();
-    sink.send((query, tx))
+    let (rtt, sender) = (connection.mean_rtt(), connection.sender);
+    sender
+        .send((query, tx))
         .map_err(move |e| {
             info!("failed to send over existing connection: {}", e);
             IoError::new(
@@ -594,12 +649,8 @@ fn exchange_with_open_connection(
             )
         })
         .and_then(move |_| {
-            // If the conductor has more address choices, wait for shorter time
-            // to allow retry over a new connection to another address.
-            let timeout = match num_choices {
-                1 => DEFAULT_TIMEOUT,
-                _ => DEFAULT_TIMEOUT / 2,
-            };
+            // Estimate an upper bound for connection timeout as double of mean RTT
+            let timeout = rtt * 2;
             rx.into_future().timeout(timeout).map_err(move |e| {
                 warn!(
                     "waited for {:#?}, but did not receive response: {}",

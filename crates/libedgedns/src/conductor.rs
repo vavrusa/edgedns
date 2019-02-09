@@ -175,6 +175,8 @@ impl Conductor {
         query: Message,
         origin: Arc<Origin>,
     ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
+        let varz = scope.context.varz.clone();
+
         // Create a waitable future for the query result
         let (tx, rx) = oneshot::channel();
         let wait_response = rx
@@ -187,14 +189,26 @@ impl Conductor {
 
         if self.timetable.pending.start(&key, tx) {
             debug!("started new query '{}'", key);
+            let start_timer = varz.upstream_rtt.start_timer();
             Either::A(
                 self.exchanger
                     .exchange(scope, query, origin)
                     .and_then(|_| wait_response)
                     // Clear the pending query on exchange errors
-                    .or_else(move |e| {
-                        pending.clear(&key);
-                        Err(e)
+                    .then(move |res| {
+                        drop(start_timer);
+                        match res {
+                            Ok((msg, from)) => {
+                                varz.upstream_response_sizes.observe(msg.len() as f64);
+                                varz.upstream_received.inc();
+                                Ok((msg, from))
+                            },
+                            Err(e) => {
+                                varz.upstream_timeout.inc();
+                                pending.clear(&key);
+                                Err(e)
+                            }
+                        }
                     }),
             )
         } else {
@@ -227,8 +241,10 @@ impl Exchanger for TcpExchanger {
         // Clone inner variables because Futures 0.1 only support borrows with 'static
         let exchanger = self.clone();
         let query_clone = query.clone();
+        let varz = scope.context.varz.clone();
         let try_selection = stream::iter_ok::<_, IoError>(selection.to_vec())
             .and_then(move |addr| {
+                varz.upstream_sent.inc();
                 // Attempt to do a message exchange
                 exchange_with_tcp(&addr, query_clone.clone()).then(move |res| match res {
                     Ok((message, stream)) => Ok(Some((message, stream))),
@@ -281,14 +297,18 @@ impl Exchanger for TcpExchanger {
         let num_choices = selection.len();
         match self.timetable.find_open_connection(selection) {
             Some(sink) => {
+                let varz = scope.context.varz.clone();
+                varz.upstream_sent.inc();
+
                 let pending = self.timetable.pending.clone();
                 Box::new(
                     exchange_with_open_connection(sink, query.clone(), num_choices)
                         .and_then(move |(message, peer_addr)| {
                             pending.finish(&message, &peer_addr);
+                            varz.upstream_reused.inc();
                             Ok(())
                         })
-                        .or_else(move |_| try_selection),
+                        .or_else(move |_| try_selection)
                 )
             }
             None => Box::new(try_selection),
@@ -305,11 +325,13 @@ impl Exchanger for UdpExchanger {
     fn exchange(&self, scope: Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
         let pending = self.timetable.pending.clone();
         let selection = origin.get_scoped(&scope);
+        let varz = scope.context.varz.clone();
         Box::new(
             // Iterate through all addresses in selection
             stream::iter_ok::<_, IoError>(selection.to_vec())
                 .and_then(move |addr| {
                     // Attempt to do a message exchange
+                    varz.upstream_sent.inc();
                     // TODO: implement the variant with reusing a pool of bound sockets
                     exchange_with_udp(addr, query.clone()).then(move |res| match res {
                         Ok((message, peer_addr)) => Ok(Some((message, peer_addr))),

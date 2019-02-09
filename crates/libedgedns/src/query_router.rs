@@ -95,13 +95,21 @@ impl QueryRouter {
 
         // Process query
         self.context.varz.inflight_queries.inc();
+        match scope.protocol {
+            Protocol::Udp => self.context.varz.client_queries_udp.inc(),
+            Protocol::Tcp => self.context.varz.client_queries_tcp.inc(),
+            _ => {},
+        }
 
         // TODO: Process pre-flight hooks
        
         let mut cache = self.context.cache.clone();
         let cache_key = CacheKey::from(&scope);
         let answer = match cache.get(&cache_key) {
-            Some(entry) => resolve_from_cache(&scope, entry, answer),
+            Some(entry) => {
+                self.context.varz.client_queries_cached.inc();
+                resolve_from_cache(&scope, entry, answer)
+            },
             None => {
                 // Route the request to respective handler
                 let res = match &self.router {
@@ -118,6 +126,7 @@ impl QueryRouter {
                     }
                     Err(e) => {
                         info!("query router failed to resolve '{}': {:?}", cache_key, e);
+                        self.context.varz.client_queries_errors.inc();
                         resolve_to_error(&scope, answer, Rcode::ServFail, false)
                     }
                 }

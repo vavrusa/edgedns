@@ -31,7 +31,8 @@ pub struct Inner {
     pub upstream_sent: Counter,
     pub upstream_received: Counter,
     pub upstream_timeout: Counter,
-    pub upstream_avg_rtt: Gauge,
+    pub upstream_reused: Counter,
+    pub upstream_rtt: Histogram,
     pub upstream_response_sizes: Histogram,
 }
 
@@ -170,15 +171,21 @@ impl Inner {
                 labels! {"handler" => "all",}
             ))
             .unwrap(),
-            upstream_avg_rtt: register_gauge!(opts!(
-                "edgedns_upstream_avg_rtt",
-                "Average RTT to upstream servers",
+            upstream_reused: register_counter!(opts!(
+                "edgedns_upstream_reused",
+                "Number queries reusing the same connection",
                 labels! {"handler" => "all",}
+            ))
+            .unwrap(),
+            upstream_rtt: register_histogram!(histogram_opts!(
+                "edgedns_upstream_rtt",
+                "Upstream response RTT in seconds",
+                vec![0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1., 1.5, 2., 4., 5., 10.]
             ))
             .unwrap(),
             upstream_response_sizes: register_histogram!(histogram_opts!(
                 "edgedns_upstream_response_sizes",
-                "Response size in bytes",
+                "Upstream response size in bytes",
                 vec![64.0, 128.0, 192.0, 256.0, 512.0, 1024.0, 2048.0]
             ))
             .unwrap(),

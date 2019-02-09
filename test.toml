@@ -5,8 +5,7 @@
 type = "forwarder"
 
 # Upstream servers
-#servers = ["1.1.1.1:53", "9.9.9.9:53"]
-servers = ["1.1.1.1:53", "9.9.9.9:53"]
+servers = ["1.1.1.1:53"]
 
 # Load balancing/failover strategy: "uniform", "fallback" or "minload"
 strategy = "consistent"
@@ -69,14 +68,14 @@ socket_path = "edgedns.dnstap"
 
 # Number of threads handling client queries received over UDP
 # More than 1 is rarely required. Set to 0 to disable UDP.
-threads_udp = 4
+threads_udp = 1
 
 # Number of threads handling client queries received over TCP
 # More than 1 is very rarely required. Set to 0 to disable TCP.
 threads_tcp = 1
 
 # Max number of clients using TCP
-max_tcp_clients = 6
+max_tcp_clients = 100
 
 # Max number of clients waiting for a response
 max_waiting_clients = 1000000

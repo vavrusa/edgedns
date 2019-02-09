@@ -6,7 +6,7 @@ use domain_core::bits::Message;
 use jumphash::JumpHasher;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,7 @@ impl Default for LoadBalancingMode {
 #[derive(Clone)]
 pub struct Forwarder {
     origin: Arc<Origin>,
+    upstream_total_timeout: Duration,
 }
 
 impl Forwarder {
@@ -35,6 +36,7 @@ impl Forwarder {
         let conductor = scope.context.conductor.clone();
         conductor
             .resolve(scope.clone(), scope.query.clone(), self.origin.clone())
+            .timeout(self.upstream_total_timeout).map_err(|_| ErrorKind::TimedOut.into())
             .map(move |(message, _from)| message)
     }
 }
@@ -49,7 +51,7 @@ impl From<&Arc<Config>> for Forwarder {
                 .map(|addr| addr.parse::<SocketAddr>().unwrap())
                 .collect(),
             lbmode: config.lbmode,
-            upstream_max_failure_duration: config.upstream_max_failure_duration,
+            upstream_total_timeout: Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS),
         }
         .build()
     }
@@ -59,7 +61,7 @@ impl From<&Arc<Config>> for Forwarder {
 pub struct Builder {
     upstream_servers: Vec<SocketAddr>,
     lbmode: LoadBalancingMode,
-    upstream_max_failure_duration: Duration,
+    upstream_total_timeout: Duration,
 }
 
 impl Default for Builder {
@@ -67,7 +69,7 @@ impl Default for Builder {
         Self {
             upstream_servers: vec![],
             lbmode: LoadBalancingMode::default(),
-            upstream_max_failure_duration: Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS),
+            upstream_total_timeout: Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS),
         }
     }
 }
@@ -99,7 +101,7 @@ impl Builder {
             LoadBalancingMode::Consistent => Arc::new(JumpHashOrigin::new(self.upstream_servers)),
         };
 
-        Forwarder { origin }
+        Forwarder { origin, upstream_total_timeout: self.upstream_total_timeout }
     }
 }
 

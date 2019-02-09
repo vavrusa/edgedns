@@ -1,6 +1,6 @@
 use crate::cache::CacheKey;
 use crate::codecs::*;
-use crate::config::Config;
+use crate::config::{Config, ServerType};
 use crate::query_router::Scope;
 use domain_core::bits::*;
 use futures::future::Either;
@@ -10,7 +10,7 @@ use log::*;
 use parking_lot::RwLock;
 use socket2::{Domain, Socket, Type};
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 use std::io::{Error as IoError, ErrorKind};
 use std::net::SocketAddr;
@@ -43,6 +43,80 @@ pub trait Origin: Send + Sync {
     /// Convenience function to return an iterator over addresses.
     fn iter(&self) -> Iter<SocketAddr> {
         self.get().iter()
+    }
+}
+
+/// The conductor schedules outgoing queries identified by message, and an origin.
+/// It doesn't implement any specific outgoing connection protocol, and is used to provide
+/// basic facilities for specialized conductor implementations.
+#[derive(Clone)]
+pub struct Conductor {
+    timetable: Timetable,
+    exchanger: Arc<Exchanger>,
+}
+
+impl Conductor {
+    /// Create a new constructor instance with default configuration values.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Builder::default().build())
+    }
+
+    /// Resolve a query with given origin, and wait for response.
+    pub fn resolve(
+        &self,
+        scope: Scope,
+        query: Message,
+        origin: Arc<Origin>,
+    ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
+        let varz = scope.context.varz.clone();
+
+        // Create a waitable future for the query result
+        let (tx, rx) = oneshot::channel();
+        let wait_response = rx
+            .map_err(|_| IoError::new(ErrorKind::UnexpectedEof, "cannot receive a query response"))
+            .into_future();
+
+        // If the query is already being solved, register a waitable future
+        let key = CacheKey::from(&scope);
+        let pending = self.timetable.pending.clone();
+
+        // First query creates a queue for other same queries
+        let queue_len = self.timetable.pending.start(&key, tx);
+        if queue_len == 1 {
+            debug!("registered query '{}'", key);
+            let start_timer = varz.upstream_rtt.start_timer();
+            Either::A(
+                self.exchanger
+                    .exchange(scope, query, origin)
+                    .and_then(|_| wait_response)
+                    // Clear the pending query on exchange errors
+                    .then(move |res| {
+                        drop(start_timer);
+                        match res {
+                            Ok((msg, from)) => {
+                                varz.upstream_response_sizes.observe(msg.len() as f64);
+                                varz.upstream_received.inc();
+                                Ok((msg, from))
+                            }
+                            Err(e) => {
+                                varz.upstream_timeout.inc();
+                                pending.clear(&key);
+                                Err(e)
+                            }
+                        }
+                    }),
+            )
+        } else {
+            debug!("enqueued query '{}' ({} waiting)", key, queue_len);
+            Either::B(wait_response)
+        }
+    }
+
+    pub fn process_list(&self, f: &mut String) {
+        let pending_guard = self.timetable.pending.inner.write();
+        for (key, ticket_list) in &*pending_guard {
+            writeln!(f, "{}\t{} waiting", key, ticket_list.len()).unwrap();
+        }
     }
 }
 
@@ -87,10 +161,20 @@ impl Timetable {
         address: SocketAddr,
         sink: ConnectionSender,
         expected_rtt: Duration,
-    ) {
-        self.connections
-            .write()
-            .insert(address, ConnectionTracker::new(sink, expected_rtt));
+    ) -> bool {
+        // Check if there's an already open connection
+        let mut connections = self.connections.write();
+        match connections.get_mut(&address) {
+            Some(ref mut c) => {
+                c.update(expected_rtt);
+                false
+            },
+            None => {
+                // Insert a new connection tracker if not exists
+                connections.insert(address, ConnectionTracker::new(sink, expected_rtt));
+                true
+            }
+        }
     }
 
     /// Removes an open connection for given address from the timetable.
@@ -104,7 +188,7 @@ impl Timetable {
 #[derive(Default)]
 struct PendingQueries {
     max_clients_waiting: usize,
-    inner: RwLock<HashMap<CacheKey, Vec<ResponseSender>>>,
+    inner: RwLock<HashMap<CacheKey, VecDeque<ResponseSender>>>,
 }
 
 impl PendingQueries {
@@ -116,21 +200,23 @@ impl PendingQueries {
     }
 
     /// Register a query identified by `key` as pending, and add `sink` to the queue of waiting futures.
-    pub fn start(&self, key: &CacheKey, sink: ResponseSender) -> bool {
+    pub fn start(&self, key: &CacheKey, sink: ResponseSender) -> usize {
         let mut locked = self.inner.write();
         match locked.get_mut(&key) {
             Some(v) => {
                 // If the queue is longer than the maximum of clients waiting, recycle an oldest waiting client
                 // The oldest waiting client is at the position 1 (the client executing the query is on position 0)
                 if self.max_clients_waiting > 0 && v.len() >= self.max_clients_waiting {
-                    v.remove(1);
+                    v.pop_front();
                 }
-                v.push(sink);
-                false
+                v.push_back(sink);
+                v.len()
             }
             None => {
-                locked.insert(key.clone(), vec![sink]);
-                true
+                let mut v = VecDeque::with_capacity(1);
+                v.push_back(sink);
+                locked.insert(key.clone(), v);
+                1
             }
         }
     }
@@ -164,6 +250,10 @@ impl PendingQueries {
 /// MPSC sink to an established connection.
 type ResponseSender = oneshot::Sender<(Message, SocketAddr)>;
 type ConnectionSender = mpsc::Sender<(Message, ResponseSender)>;
+type ConnectionReceiver = mpsc::Receiver<(Message, ResponseSender)>;
+
+/// Maps addresses of established connections to their message queues (sinks).
+type EstablishedConnections = RwLock<HashMap<SocketAddr, ConnectionTracker>>;
 
 /// Established connection tracker.
 #[derive(Clone)]
@@ -195,82 +285,7 @@ impl ConnectionTracker {
 
     /// Round duration to milliseconds and cap at 30 seconds.
     fn round_to_millis(d: Duration) -> u64 {
-        cmp::min(d.as_secs(), 30) * 1000 + d.subsec_millis() as u64
-    }
-}
-
-/// Maps addresses of established connections to their message queues (sinks).
-type EstablishedConnections = RwLock<HashMap<SocketAddr, ConnectionTracker>>;
-
-/// The conductor schedules outgoing queries identified by message, and an origin.
-/// It doesn't implement any specific outgoing connection protocol, and is used to provide
-/// basic facilities for specialized conductor implementations.
-#[derive(Clone)]
-pub struct Conductor {
-    timetable: Timetable,
-    exchanger: Arc<Exchanger>,
-}
-
-impl Conductor {
-    /// Create a new constructor instance with default configuration values.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Builder::default().build())
-    }
-
-    /// Resolve a query with given origin, and wait for response.
-    pub fn resolve(
-        &self,
-        scope: Scope,
-        query: Message,
-        origin: Arc<Origin>,
-    ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
-        let varz = scope.context.varz.clone();
-
-        // Create a waitable future for the query result
-        let (tx, rx) = oneshot::channel();
-        let wait_response = rx
-            .map_err(|_| IoError::new(ErrorKind::UnexpectedEof, "cannot receive a query response"))
-            .into_future();
-
-        // If the query is already being solved, register a waitable future
-        let key = CacheKey::from(&query);
-        let pending = self.timetable.pending.clone();
-
-        if self.timetable.pending.start(&key, tx) {
-            debug!("started new query '{}'", key);
-            let start_timer = varz.upstream_rtt.start_timer();
-            Either::A(
-                self.exchanger
-                    .exchange(scope, query, origin)
-                    .and_then(|_| wait_response)
-                    // Clear the pending query on exchange errors
-                    .then(move |res| {
-                        drop(start_timer);
-                        match res {
-                            Ok((msg, from)) => {
-                                varz.upstream_response_sizes.observe(msg.len() as f64);
-                                varz.upstream_received.inc();
-                                Ok((msg, from))
-                            }
-                            Err(e) => {
-                                varz.upstream_timeout.inc();
-                                pending.clear(&key);
-                                Err(e)
-                            }
-                        }
-                    }),
-            )
-        } else {
-            debug!("enqueued query '{}'", key);
-            Either::B(wait_response)
-        }
-    }
-
-    pub fn process_list(&self, f: &mut String) {
-        let pending_guard = self.timetable.pending.inner.write();
-        for (key, ticket_list) in &*pending_guard {
-            writeln!(f, "{}\t{} waiting", key, ticket_list.len()).unwrap();
-        }
+        cmp::min(d.as_secs(), 30) * 1000 + u64::from(d.subsec_millis())
     }
 }
 
@@ -280,6 +295,7 @@ impl Conductor {
 struct TcpExchanger {
     timetable: Timetable,
     connection_reuse: bool,
+    connection_reuse_fallback: bool,
     connection_concurrency: usize,
 }
 
@@ -318,12 +334,15 @@ impl Exchanger for TcpExchanger {
                     // Save connection if connection reuse is enabled
                     if exchanger.connection_reuse {
                         // Save connection in pending queue
-                        tokio::spawn(keep_open_connection(
-                            exchanger.timetable.clone(),
-                            stream,
-                            exchanger.connection_concurrency,
-                            elapsed,
-                        ));
+                        let (sender, receiver) = mpsc::channel(exchanger.connection_concurrency);
+                        if exchanger.timetable.add_open_connection(peer_addr, sender, elapsed) {
+                            tokio::spawn(keep_open_connection(
+                                exchanger.timetable.clone(),
+                                stream,
+                                exchanger.connection_concurrency,
+                                receiver,
+                            ));
+                        }
                     // Close connection as early as possible if not
                     } else if let Err(e) = stream.close() {
                         warn!("error when closing connection {:?}", e);
@@ -353,15 +372,19 @@ impl Exchanger for TcpExchanger {
                 // Try to do message exchange
                 let started = Instant::now();
                 let timetable = self.timetable.clone();
+                let fast_fallback = self.connection_reuse_fallback;
                 Box::new(
-                    exchange_with_open_connection(sink, query.clone())
+                    exchange_with_open_connection(sink, query.clone(), fast_fallback)
                         .and_then(move |(message, peer_addr)| {
                             timetable.update_open_connection(&peer_addr, started.elapsed());
                             timetable.pending.finish(&message, &peer_addr);
                             varz.upstream_reused.inc();
                             Ok(())
                         })
-                        .or_else(move |_| try_selection),
+                        .or_else(move |e| {
+                            debug!("tcp error when reusing connection: {:?}", e);
+                            try_selection
+                        }),
                 )
             }
             None => Box::new(try_selection),
@@ -439,6 +462,7 @@ pub struct Builder {
     enable_tcp: bool,
     enable_udp: bool,
     connection_reuse: bool,
+    connection_reuse_fallback: bool,
     connection_concurrency: usize,
     max_active_queries: usize,
     max_clients_waiting_for_query: usize,
@@ -450,6 +474,7 @@ impl Default for Builder {
             enable_tcp: true,
             enable_udp: true,
             connection_reuse: true,
+            connection_reuse_fallback: false,
             connection_concurrency: DEFAULT_CONNECTION_CONCURRENCY,
             max_active_queries: 0,
             max_clients_waiting_for_query: 0,
@@ -486,6 +511,14 @@ impl Builder {
         self
     }
 
+    /// Test connection reuse on first message over reused connection.
+    /// This fails over quickly when the upstream doesn't appear to support connection reuse,
+    /// but it could lower the reuse rate when the upstream RTT is unpredictable (recursive).
+    pub fn with_connection_reuse_fallback(mut self, value: bool) -> Self {
+        self.connection_reuse_fallback = value;
+        self
+    }
+
     /// Use defined queue size (default is [`DEFAULT_CONNECTION_CONCURRENCY`]).
     #[allow(dead_code)]
     pub fn with_connection_concurrency(mut self, value: usize) -> Self {
@@ -516,6 +549,7 @@ impl Builder {
             Arc::new(TcpExchanger {
                 timetable: timetable.clone(),
                 connection_reuse: self.connection_reuse,
+                connection_reuse_fallback: self.connection_reuse_fallback,
                 connection_concurrency: self.connection_concurrency,
             })
         } else if self.enable_udp {
@@ -541,6 +575,7 @@ impl From<&Arc<Config>> for Conductor {
         Builder::default()
             .with_max_active_queries(config.max_active_queries)
             .with_max_clients_waiting_for_query(config.max_clients_waiting_for_query)
+            .with_connection_reuse_fallback(config.server_type == ServerType::Recursive)
             .build()
     }
 }
@@ -555,16 +590,13 @@ fn keep_open_connection(
     timetable: Timetable,
     stream: FramedStream,
     concurrency: usize,
-    expected_rtt: Duration,
+    receiver: ConnectionReceiver,
 ) -> impl Future<Item = (), Error = ()> {
     // Save connection in pending queue
     let peer_addr = stream
         .get_ref()
         .peer_addr()
         .expect("tcp connection must have a peer address");
-
-    let (sender, receiver) = mpsc::channel(concurrency);
-    timetable.add_open_connection(peer_addr, sender, expected_rtt);
 
     // Create a token bucket with channel to limit concurrency of the connection
     // In order to start new queries, there must be a token in the channel.
@@ -584,7 +616,7 @@ fn keep_open_connection(
             .zip(token_reader)
             .map(move |((msg, sink), _)| {
                 let key = CacheKey::from(&msg);
-                debug!("open connection, forwarding message '{}'", key);
+                debug!("reused connection, forwarding message '{}'", key);
                 pending.start(&key, sink);
                 msg.as_bytes().clone()
             })
@@ -602,13 +634,13 @@ fn keep_open_connection(
                 // Parse response and attempt to close pending queries
                 let tokens = if let Ok(msg) = Message::from_bytes(resp.into()) {
                     debug!(
-                        "open connection, received response '{}'",
+                        "reused connection, received response '{}'",
                         CacheKey::from(&msg)
                     );
 
                     pending.finish(&msg, &peer_addr)
                 } else {
-                    debug!("open connection, received invalid response");
+                    debug!("reused connection, received invalid response");
                     0
                 };
 
@@ -619,13 +651,13 @@ fn keep_open_connection(
                     .then(move |_| Ok::<_, IoError>(()))
             })
             .then(move |_| {
-                info!("open connection, closing for {}", peer_addr);
+                info!("reused connection, closing for {}", peer_addr);
                 timetable.remove_open_connection(&peer_addr);
                 Ok(())
             })
     };
 
-    info!("open connection, created for {}", peer_addr);
+    info!("keepalive connection for {}", peer_addr);
     replenish_tokens
         .join(sender_future)
         .join(receiver_future)
@@ -636,9 +668,10 @@ fn keep_open_connection(
 fn exchange_with_open_connection(
     connection: ConnectionTracker,
     query: Message,
+    fast_fallback: bool,
 ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
     let (tx, rx) = oneshot::channel();
-    let (rtt, sender) = (connection.mean_rtt(), connection.sender);
+    let (rtt, messages, sender) = (connection.mean_rtt(), connection.messages, connection.sender);
     sender
         .send((query, tx))
         .map_err(move |e| {
@@ -649,14 +682,16 @@ fn exchange_with_open_connection(
             )
         })
         .and_then(move |_| {
-            // Estimate an upper bound for connection timeout as double of mean RTT
-            let timeout = rtt * 2;
-            rx.into_future().timeout(timeout).map_err(move |e| {
-                warn!(
-                    "waited for {:#?}, but did not receive response: {}",
-                    timeout, e
-                );
-                IoError::new(ErrorKind::TimedOut, "timed out whilst waiting for response")
+            // First connection reuse doesn't know whether upstream supports it,
+            // so the timeout is chosen more conservatively (double RTT).
+            let timeout = if fast_fallback && messages <= 1 {
+                // Estimate an upper bound for connection timeout as double of mean RTT
+                cmp::min(rtt * 2, DEFAULT_TIMEOUT)
+            } else {
+                DEFAULT_TIMEOUT
+            };
+            rx.into_future().timeout(timeout).map_err(move |_| {
+                IoError::new(ErrorKind::TimedOut, format!("timed out ({:?})", timeout))
             })
         })
 }

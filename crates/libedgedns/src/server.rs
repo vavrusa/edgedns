@@ -19,7 +19,7 @@ use tokio::reactor::Handle;
 use stream_cancel::{StreamExt, Tripwire};
 
 /// Initial buffer size for answers to cover minimal answers.
-const INITIAL_BUF_SIZE : usize = 64;
+const INITIAL_BUF_SIZE : usize = 128;
 
 /// Enum of used server protocols.
 #[derive(Clone, Copy, Debug)]
@@ -187,14 +187,24 @@ async fn process_tcp_clients(
     tripwire: Tripwire,
 ) {
     let mut incoming = listener.incoming().take_until(tripwire);
-    while let Some(Ok(stream)) = await!(incoming.next()) {
+    while let Some(item) = await!(incoming.next()) {
+        // Check if the next client can be accepted
+        let stream = match item {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("can't accept tcp client, err {:?}", e);
+                continue
+            }
+        };
+
         let peer_addr = stream.peer_addr().expect("tcp peer has address");
+        trace!("tcp client {} connected", peer_addr);
 
         // Reuse TCP slots for each client identified by an IP address
         // This is governed by the maximum TCP client count from the configuration.
         // Each client gets a TCP slot allowance calculated as a portion of total TCP client count.
         // If the TCP slot allowance for client is reached, the client's oldest open connection is recycled.
-        let (queue_len, sender, receiver) = {
+        let (sender, receiver) = {
             let mut connections = connections.lock();
 
             // If the TCP client count is at maximum capacity, close an arbitrary client
@@ -208,7 +218,7 @@ async fn process_tcp_clients(
                 }
             }
 
-            let max_per_client = context.config.max_tcp_clients / (connections.len() + 2);
+            let max_per_client = context.config.max_tcp_clients / (connections.len() + 1);
             let queue = connections.entry(peer_addr.ip()).or_default();
 
             // Close connections exceeding the allowed count
@@ -220,16 +230,12 @@ async fn process_tcp_clients(
             }
 
             // Register new connection (port => message demultiplexer)
-            let (sender, receiver) = mpsc::channel(0);
+            let (sender, receiver) = mpsc::channel(1);
             queue.push_back((peer_addr.port(), sender.clone()));
-            (queue.len(), sender, receiver)
+            (sender, receiver)
         };
 
-        debug!(
-            "tcp client {} connected, queue length: {}",
-            peer_addr, queue_len
-        );
-
+        trace!("tcp client {} processing", peer_addr);
         tokio::spawn_async(process_stream(
             context.clone(),
             router.clone(),
@@ -241,7 +247,7 @@ async fn process_tcp_clients(
         ));
     }
 
-    info!("udp server done");
+    info!("tcp server done");
 }
 
 async fn process_stream(
@@ -263,7 +269,7 @@ async fn process_stream(
             .then(move |res| {
                 match res {
                     Ok((_, mut sink)) => {
-                        debug!("tcp stream done: {}", peer_addr);
+                        debug!("tcp stream disconnected: {}", peer_addr);
                         drop(sink.close());
                     }
                     Err(e) => {
@@ -313,8 +319,6 @@ async fn process_stream(
             connections_guard.remove(&peer_addr.ip());
         }
     }
-
-    debug!("tcp disconnected {}", peer_addr)
 }
 
 async fn process_message(

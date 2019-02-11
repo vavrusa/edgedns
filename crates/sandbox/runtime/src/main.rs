@@ -16,7 +16,7 @@ use parking_lot::{Mutex};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::codec::BytesCodec;
@@ -180,15 +180,13 @@ fn file_reloader(module_ns: Arc<Mutex<HashMap<String, Instance>>>, wasm_file: St
             .and_then(move |wasm_file| {
                 let data = read_to_end(wasm_file.clone().into()).unwrap();
                 let shared_state = shared_state.clone();
-              // let import_objects = imports! {
-              // };
-              //match instantiate(&data, import_objects()) {
-              match instantiate(shared_state.clone(), &data) {
+                let name: String = Path::new(&wasm_file).file_name()
+                    .unwrap().to_str().unwrap().into();
+                match instantiate(name.clone(), shared_state.clone(), &data) {
                     Ok(instance) => {
                         let mut ns = module_ns.lock();
-                        let i = Instance::new(instance);
-                        ns.insert(wasm_file, i.clone());
-                        let scheduled = shared_state.invoke_start(i.clone());
+                        ns.insert(name.clone(), instance.clone());
+                        let scheduled = shared_state.invoke_start(instance.clone());
                         future::Either::A(scheduled)
                     },
                     Err(e) => {

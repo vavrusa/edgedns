@@ -19,28 +19,45 @@ pub enum CallError {
   VM(Box<error::CallError>),
 }
 
-#[derive(Clone)]
-pub struct Instance {
-    inner: Arc<Mutex<wasmer_runtime::Instance>>,
+pub type Instance = Arc<Mutex<InstanceWrapper>>;
+
+/// Wrapper for `wasmer_runtime::Instance`, to implement traits and
+/// methods.
+pub struct InstanceWrapper {
+    name: String,
+    inner: wasmer_runtime::Instance,
 }
 
-impl Instance {
-    pub fn new(i: wasmer_runtime::Instance) -> Self {
-        Instance{
-            inner: Arc::new(Mutex::new(i)),
+impl InstanceWrapper {
+    pub fn new(name: String, i: wasmer_runtime::Instance) -> Self {
+        InstanceWrapper{
+            name: name,
+            inner: i,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+}
+unsafe impl Send for InstanceWrapper {}
+unsafe impl Sync for InstanceWrapper {}
+
+
+impl Drop for InstanceWrapper {
+    fn drop(&mut self) {
+        unsafe {
+            Box::from_raw(self.inner.context_mut().data as *mut SharedState);
         }
     }
 }
-unsafe impl Send for Instance {}
-unsafe impl Sync for Instance {}
 
-// TODO: claim leaked memory when replacing instance
-pub fn instantiate(shared_state: SharedState, data: &[u8]) -> error::Result<wasmer_runtime::Instance> {
+pub fn instantiate(name: String, shared_state: SharedState, data: &[u8]) -> error::Result<Instance> {
     wasmer_runtime::instantiate(data, host_calls::import_objects())
         .map(|mut instance|{
             let mut ctx = instance.context_mut();
             ctx.data = Box::leak(Box::new(shared_state)) as *mut _ as *mut c_void;
-            instance
+            Arc::new(Mutex::new(InstanceWrapper::new(name, instance)))
         })
 }
 
@@ -240,7 +257,7 @@ impl SharedState {
     field_name: &str,
     args: &[Value],
   ) -> Result<Vec<Value>, Box<error::CallError>> {
-      instance.inner.lock().call(field_name, args)
+      instance.lock().inner.call(field_name, args)
   }
 
   fn spawned_futures(&self, instance: Instance) -> impl Future<Item = (), Error = CallError> {

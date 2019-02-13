@@ -17,7 +17,6 @@
 //! previously unknown queries is observed.
 
 use crate::config::Config;
-use crate::varz::Varz;
 use crate::query_router::Scope;
 use bytes::Bytes;
 use clockpro_cache::*;
@@ -46,6 +45,15 @@ pub struct CacheKey {
     qname: Dname,
     qtype: Rtype,
     dnssec: bool,
+    scope: Vec<u8>,
+}
+
+impl CacheKey {
+    /// Set current scope for given cache key (an arbitrary byte slice).
+    pub fn with_scope(mut self, scope: &[u8]) -> Self {
+        self.scope.extend_from_slice(scope);
+        self
+    }
 }
 
 impl Default for CacheKey {
@@ -54,6 +62,7 @@ impl Default for CacheKey {
             qname: Dname::root(),
             qtype: Rtype::Null,
             dnssec: false,
+            scope: Vec::new(),
         }
     }
 }
@@ -65,6 +74,7 @@ impl From<(&Dname, Rtype, Class, bool)> for CacheKey {
             qname: name.clone(),
             qtype,
             dnssec,
+            scope: Vec::new(),
         }
     }
 }
@@ -79,6 +89,7 @@ impl From<&Message> for CacheKey {
                     Some(opt) => opt.dnssec_ok(),
                     None => false
                 },
+                scope: Vec::new(),
             },
             None => Self::default(),
         }
@@ -95,6 +106,7 @@ impl From<&Scope> for CacheKey {
                 Some(opt) => opt.dnssec_ok(),
                 None => false
             },
+            scope: Vec::new(),
         }
     }
 }
@@ -102,7 +114,11 @@ impl From<&Scope> for CacheKey {
 impl fmt::Display for CacheKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.qname.fmt(f)?;
-        write!(f, " {:?}", self.qtype)
+        write!(f, " {:?}", self.qtype)?;
+        if !self.scope.is_empty() {
+            write!(f, "| {:?} ", self.scope)?;
+        }
+        Ok(())
     }
 }
 
@@ -164,27 +180,23 @@ impl From<Message> for CacheEntry {
 #[derive(Clone)]
 pub struct Cache {
     inner: Arc<Mutex<ClockProCache<CacheKey, CacheEntry>>>,
-    varz: Varz,
     min_ttl: u32,
     max_ttl: u32,
 }
 
 impl Cache {
-    pub fn new(config: &Config, varz: Varz) -> Self {
-        let inner = ClockProCache::new(config.cache_size).unwrap();
+    pub fn new(capacity: usize, min_ttl: u32, max_ttl: u32) -> Self {
+        let inner = ClockProCache::new(capacity).expect("cache");
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            varz,
-            min_ttl: config.min_ttl,
-            max_ttl: config.max_ttl,
+            min_ttl,
+            max_ttl,
         }
     }
 
     pub fn stats(&self) -> CacheStats {
         let cache = self.inner.lock();
         CacheStats {
-            hits: 0,
-            misses: 0,
             inserted: cache.inserted(),
             evicted: cache.evicted(),
             recent_len: cache.recent_len(),
@@ -205,7 +217,6 @@ impl Cache {
         cache
             .get_mut(&cache_key)
             .and_then(|entry| {
-                self.varz.cache_hits.inc();
                 if !entry.is_expired() {
                     Some(entry.clone())
                 } else {
@@ -213,16 +224,20 @@ impl Cache {
                 }
             })
             .or_else(|| {
-                self.varz.cache_misses.inc();
                 None
             })
     }
 }
 
+/// Build from configuration pattern
+impl From<&Arc<Config>> for Cache {
+    fn from(config: &Arc<Config>) -> Self {
+        Self::new(config.cache_size, config.min_ttl, config.max_ttl)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
     pub inserted: u64,
     pub evicted: u64,
     pub recent_len: usize,

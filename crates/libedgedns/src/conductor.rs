@@ -77,7 +77,7 @@ impl Conductor {
             .into_future();
 
         // If the query is already being solved, register a waitable future
-        let key = CacheKey::from(&scope);
+        let key = CacheKey::from(&query);
         let pending = self.timetable.pending.clone();
 
         // First query creates a queue for other same queries

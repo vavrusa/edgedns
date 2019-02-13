@@ -133,8 +133,16 @@ impl QueryRouter {
                 // Handle errors during processing
                 match res {
                     Ok(message) => {
-                        trace!("storing message in cache: {}B", message.len());
-                        cache.insert(cache_key, message.clone().into());
+                        let is_valid = {
+                            let hdr = message.header();
+                            !hdr.tc() && hdr.qr()
+                        };
+
+                        if is_valid {
+                            trace!("storing message in cache: {}B", message.len());
+                            cache.insert(cache_key, message.clone().into());
+                        }
+
                         resolve_from_answer(&scope, message, answer, None)
                     }
                     Err(e) => {
@@ -178,7 +186,8 @@ fn resolve_from_answer(
 
     // Build response from cached message
     let mut message = MessageBuilder::from_buf(answer.clone());
-    message.enable_compression();
+    // TODO: Disabled because habbo.com.mx A fails to compress
+    // message.enable_compression();
     message.set_limit(max_bufsize);
 
     // Set header flags for response
@@ -227,8 +236,14 @@ fn resolve_from_answer(
             // TODO: add OPT before finalizing
             Ok(message.finish())
         }
-        Err(_) => {
+        Err(e) => {
             // Truncation occured, return error
+            debug!(
+                "failed to generate a response: {:?} ({}B, max: {})",
+                e,
+                source.len(),
+                max_bufsize
+            );
             resolve_to_error(scope, answer, src_header.rcode(), true)
         }
     }

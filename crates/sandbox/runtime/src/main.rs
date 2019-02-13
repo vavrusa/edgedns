@@ -203,8 +203,8 @@ fn runtime_context() -> Arc<Context> {
     let config = Arc::new(Config::default());
     let varz = Varz::default();
     let conductor = Conductor::new();
-    let cache = Cache::new(&config, varz.clone());
-    Context::new(config.clone(), conductor, cache, varz.clone())
+    let cache = Cache::from(&config);
+    Context::new(config.clone(), conductor, cache, varz)
 }
 
 fn read_to_end(path: PathBuf) -> Result<Vec<u8>, io::Error> {

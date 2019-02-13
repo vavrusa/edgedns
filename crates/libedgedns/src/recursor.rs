@@ -115,9 +115,9 @@ impl Recursor {
                     // Check infrastructure cache first
                     let cache_key = CacheKey::from(&msg);
                     let cached_response = match cache {
-                        Some(ref mut cache) => {
-                            cache.get(&cache_key).and_then(move |e| Some(e.as_message()))
-                        }
+                        Some(ref mut cache) => cache
+                            .get(&cache_key)
+                            .and_then(move |e| Some(e.as_message())),
                         None => None,
                     };
 
@@ -130,9 +130,7 @@ impl Recursor {
                         }
                         None => {
                             let origin = Arc::new(PreferenceList { addresses });
-                            let response = await!(conductor
-                                .resolve(scope.clone(), msg, origin)
-                            );
+                            let response = await!(conductor.resolve(scope.clone(), msg, origin));
 
                             // Update infrastructure cache
                             if let Some(ref mut cache) = cache {
@@ -145,9 +143,18 @@ impl Recursor {
                                     // Only accept NS type responses, or responses that are authoritative
                                     // e.g. not referrals, as it may be a different answer within the same zone cut
                                     let is_infrastructure = match msg.first_question() {
-                                        Some(q) => q.qtype() == Rtype::Ns || msg.header().aa(),
+                                        Some(q) => match q.qtype() {
+                                            Rtype::Ns => true,
+                                            Rtype::Ds => {
+                                                // Don't store empty DS as they may come from child scope
+                                                // TODO: resolver should not make that mistake
+                                                msg.header_counts().ancount() > 0
+                                            }
+                                            _ => msg.header().aa(),
+                                        },
                                         None => false,
                                     };
+
                                     // TODO: avoid inserting final response
                                     if is_valid && is_infrastructure {
                                         cache.insert(cache_key, msg.clone().into());

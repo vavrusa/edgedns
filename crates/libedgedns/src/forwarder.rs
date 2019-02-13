@@ -43,7 +43,6 @@ impl Forwarder {
         let conductor = scope.context.conductor.clone();
         conductor
             .resolve(scope.clone(), scope.query.clone(), self.origin.clone())
-            .timeout(self.upstream_total_timeout).map_err(|_| ErrorKind::TimedOut.into())
             .map(move |(message, _from)| message)
     }
 }

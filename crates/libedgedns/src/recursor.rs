@@ -3,7 +3,7 @@ use crate::conductor::Origin;
 use crate::config::Config;
 use crate::context::Context;
 use crate::query_router::Scope;
-use crate::{HEALTH_CHECK_MS, UPSTREAM_TOTAL_TIMEOUT_MS};
+use crate::HEALTH_CHECK_MS;
 use bytes::Bytes;
 use domain_core::bits::*;
 use domain_core::iana::*;
@@ -132,7 +132,7 @@ impl Recursor {
                             let origin = Arc::new(PreferenceList { addresses });
                             let response = await!(conductor
                                 .resolve(scope.clone(), msg, origin)
-                                .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / 2)));
+                            );
 
                             // Update infrastructure cache
                             if let Some(ref mut cache) = cache {

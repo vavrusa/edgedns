@@ -21,11 +21,10 @@ use std::time::{Duration, Instant};
 use tokio::net::{tcp, TcpStream, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
+use clockpro_cache::*;
 
 /// Default connection concurrency (number of outstanding requests for single connection)
 const DEFAULT_CONNECTION_CONCURRENCY: usize = 1000;
-/// Default timeout for message exchange
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Default keepalive interval for idle connections
 const DEFAULT_KEEPALIVE: Duration = Duration::from_millis(10_000);
 
@@ -75,6 +74,14 @@ impl Conductor {
         let (tx, rx) = oneshot::channel();
         let wait_response = rx
             .map_err(|_| IoError::new(ErrorKind::UnexpectedEof, "cannot receive a query response"))
+            // TODO: make ExchangeFuture a type and implement cleanup on Drop
+            .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::TimedOut,
+                    "timed out whilst waiting for upstreams",
+                )
+            })
             .into_future();
 
         // If the query is already being solved, register a waitable future
@@ -89,13 +96,6 @@ impl Conductor {
             Either::A(
                 self.exchanger
                     .exchange(scope, query, origin)
-                    .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
-                    .map_err(|_| {
-                        IoError::new(
-                            ErrorKind::TimedOut,
-                            "timed out whilst waiting for upstreams",
-                        )
-                    })
                     .and_then(|_| wait_response)
                     // Clear the pending query on exchange errors
                     .then(move |res| {
@@ -107,6 +107,7 @@ impl Conductor {
                                 Ok((msg, from))
                             }
                             Err(e) => {
+                                trace!("error in resolve: {:?}", e);
                                 varz.upstream_timeout.inc();
                                 pending.clear(&key);
                                 Err(e)
@@ -137,7 +138,7 @@ trait Exchanger: Send + Sync {
 }
 
 /// Structure for conductor bookkeeping, it tracks pending queries and open connections.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Timetable {
     pending: Arc<PendingQueries>,
     connections: Arc<EstablishedConnections>,
@@ -146,7 +147,7 @@ struct Timetable {
 impl Timetable {
     /// Returns an open connection for an address from the given list (if exists).
     fn find_open_connection(&self, addresses: &[SocketAddr]) -> Option<ConnectionTracker> {
-        let connections = self.connections.read();
+        let mut connections = self.connections.write();
         for addr in addresses {
             if let Some(c) = connections.get(addr) {
                 return Some(c.clone());
@@ -179,8 +180,7 @@ impl Timetable {
             }
             None => {
                 // Insert a new connection tracker if not exists
-                connections.insert(address, ConnectionTracker::new(sink, expected_rtt));
-                true
+                connections.insert(address, ConnectionTracker::new(sink, expected_rtt))
             }
         }
     }
@@ -261,7 +261,7 @@ type ConnectionSender = mpsc::Sender<(Message, ResponseSender)>;
 type ConnectionReceiver = mpsc::Receiver<(Message, ResponseSender)>;
 
 /// Maps addresses of established connections to their message queues (sinks).
-type EstablishedConnections = RwLock<HashMap<SocketAddr, ConnectionTracker>>;
+type EstablishedConnections = RwLock<ClockProCache<SocketAddr, ConnectionTracker>>;
 
 /// Established connection tracker.
 #[derive(Clone)]
@@ -310,6 +310,7 @@ struct TcpExchanger {
 impl Exchanger for TcpExchanger {
     fn exchange(&self, scope: Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
         let selection = origin.get_scoped(&scope);
+        let num_choices = selection.len();
 
         // Clone inner variables because Futures 0.1 only support borrows with 'static
         let exchanger = self.clone();
@@ -320,7 +321,9 @@ impl Exchanger for TcpExchanger {
                 varz.upstream_sent.inc();
                 // Attempt to do a message exchange
                 let duration = Instant::now();
-                exchange_with_tcp(&addr, query_clone.clone()).then(move |res| match res {
+                exchange_with_tcp(&addr, query_clone.clone())
+                .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / num_choices as u64))
+                .then(move |res| match res {
                     Ok((message, stream)) => Ok(Some((message, stream, addr, duration.elapsed()))),
                     Err(e) => {
                         info!("error while talking to {}: {}", addr, e);
@@ -409,6 +412,7 @@ impl Exchanger for UdpExchanger {
     fn exchange(&self, scope: Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
         let pending = self.timetable.pending.clone();
         let selection = origin.get_scoped(&scope);
+        let num_choices = selection.len();
         let varz = scope.context.varz.clone();
         let query_clone = query.clone();
         Box::new(
@@ -418,7 +422,9 @@ impl Exchanger for UdpExchanger {
                     // Attempt to do a message exchange
                     varz.upstream_sent.inc();
                     // TODO: implement the variant with reusing a pool of bound sockets
-                    exchange_with_udp(addr, query.clone()).then(move |res| match res {
+                    exchange_with_udp(addr, query.clone())
+                    .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / num_choices as u64))
+                    .then(move |res| match res {
                         Ok((message, peer_addr)) => Ok(Some((message, peer_addr))),
                         Err(e) => {
                             info!("error while talking to {}: {}", addr, e);
@@ -488,6 +494,7 @@ pub struct Builder {
     connection_concurrency: usize,
     max_active_queries: usize,
     max_clients_waiting_for_query: usize,
+    max_keepalive_connections: usize,
 }
 
 impl Default for Builder {
@@ -500,6 +507,7 @@ impl Default for Builder {
             connection_concurrency: DEFAULT_CONNECTION_CONCURRENCY,
             max_active_queries: 0,
             max_clients_waiting_for_query: 0,
+            max_keepalive_connections: DEFAULT_CONNECTION_CONCURRENCY,
         }
     }
 }
@@ -522,17 +530,6 @@ impl Builder {
         self
     }
 
-    /// Build conductor with support for reusing TCP connections.
-    /// This implies support for TCP.
-    #[allow(dead_code)]
-    pub fn with_connection_reuse(mut self, value: bool) -> Self {
-        self.connection_reuse = value;
-        if value {
-            self.enable_tcp = value;
-        }
-        self
-    }
-
     /// Test connection reuse on first message over reused connection.
     /// This fails over quickly when the upstream doesn't appear to support connection reuse,
     /// but it could lower the reuse rate when the upstream RTT is unpredictable (recursive).
@@ -545,6 +542,13 @@ impl Builder {
     #[allow(dead_code)]
     pub fn with_connection_concurrency(mut self, value: usize) -> Self {
         self.connection_concurrency = value;
+        self
+    }
+
+    /// Set maximum number of upstream connections (default is 1000).
+    /// When set to 0, it disables connection reuse as no upstream connection could be kept open.
+    pub fn with_max_keepalive_connections(mut self, value: usize) -> Self {
+        self.max_keepalive_connections = value;
         self
     }
 
@@ -564,7 +568,7 @@ impl Builder {
     pub fn build(self) -> Conductor {
         let timetable = Timetable {
             pending: Arc::new(PendingQueries::new(self.max_clients_waiting_for_query)),
-            connections: Arc::new(EstablishedConnections::default()),
+            connections: Arc::new(EstablishedConnections::new(ClockProCache::new(self.max_keepalive_connections).expect("connection cache"))),
         };
 
         let exchanger: Arc<Exchanger> = if self.enable_tcp {
@@ -597,6 +601,7 @@ impl From<&Arc<Config>> for Conductor {
         Builder::default()
             .with_max_active_queries(config.max_active_queries)
             .with_max_clients_waiting_for_query(config.max_clients_waiting_for_query)
+            .with_max_keepalive_connections(config.max_upstream_connections)
             .with_connection_reuse_fallback(config.server_type == ServerType::Recursive)
             .build()
     }
@@ -706,10 +711,10 @@ fn exchange_with_open_connection(
             // First connection reuse doesn't know whether upstream supports it,
             // so the timeout is chosen more conservatively (double RTT).
             let timeout = if fast_fallback && messages <= 100 {
-                // Estimate an upper bound for connection timeout as 150% of mean RTT
-                cmp::min((rtt * 3) / 2, DEFAULT_TIMEOUT)
+                // Estimate an upper bound for connection timeout 20% or +100ms of mean RTT
+                cmp::min((120 * rtt) / 100, rtt + Duration::from_millis(100))
             } else {
-                DEFAULT_TIMEOUT
+                Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / 2)
             };
             rx.into_future().timeout(timeout).map_err(move |_| {
                 IoError::new(ErrorKind::TimedOut, format!("timed out ({:?})", timeout))
@@ -749,8 +754,6 @@ fn exchange_with_tcp(
     query: Message,
 ) -> impl Future<Item = (Message, FramedStream), Error = IoError> {
     create_tcp_connection(addr)
-        .timeout(DEFAULT_TIMEOUT)
-        .map_err(move |_e| IoError::new(ErrorKind::TimedOut, "timed out whilst connecting"))
         .map(move |stream| {
             // Disable Nagle and convert to framed transport
             drop(stream.set_nodelay(true));
@@ -762,7 +765,6 @@ fn exchange_with_tcp(
                 .and_then(move |stream| {
                     stream
                         .into_future()
-                        .timeout(DEFAULT_TIMEOUT)
                         .map_err(move |_e| {
                             IoError::new(ErrorKind::UnexpectedEof, "no response within timeout")
                         })
@@ -807,10 +809,7 @@ fn exchange_with_udp(
                     }
                 })
                 .into_future()
-                .timeout(DEFAULT_TIMEOUT)
-                .map_err(move |_e| {
-                    IoError::new(ErrorKind::TimedOut, "timed out whilst waiting for response")
-                })
+                .map_err(move |_| ErrorKind::UnexpectedEof.into())
                 // Parse the response into message and unblock waiting futures
                 .and_then(move |(response, _stream)| match response {
                     Some(response) => match Message::from_bytes(response.into()) {
@@ -906,7 +905,7 @@ mod test {
 
     #[bench]
     fn batched_noreuse_1k(b: &mut Bencher) {
-        let conductor = Builder::default().with_connection_reuse(false).build();
+        let conductor = Builder::default().with_max_keepalive_connections(0).build();
         bench_batched(b, Arc::new(conductor))
     }
 

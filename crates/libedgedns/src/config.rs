@@ -72,6 +72,7 @@ pub struct Config {
     pub max_waiting_clients: usize,
     pub max_active_queries: usize,
     pub max_clients_waiting_for_query: usize,
+    pub max_upstream_connections: usize,
     pub hooks_basedir: Option<String>,
     pub hooks_socket_path: Option<String>,
 }
@@ -105,6 +106,7 @@ impl Default for Config {
              max_waiting_clients: 1_000_000,
              max_active_queries: 100_000,
              max_clients_waiting_for_query: 1_000,
+             max_upstream_connections: 1_000,
              hooks_basedir: None,
              hooks_socket_path: None,
         }
@@ -296,6 +298,13 @@ impl Config {
                     .expect("global.max_clients_waiting_for_query must be an integer")
             }) as usize;
 
+        let max_upstream_connections = config_global
+            .and_then(|x| x.get("max_upstream_connections"))
+            .map_or(1_000, |x| {
+                x.as_integer()
+                    .expect("global.max_upstream_connections must be an integer")
+            }) as usize;
+
         if max_clients_waiting_for_query == 0 {
             warn!("configured with unbounded number of clients waiting for query, default: {}", 1_000);
         }
@@ -373,6 +382,7 @@ impl Config {
             max_waiting_clients,
             max_active_queries,
             max_clients_waiting_for_query,
+            max_upstream_connections,
             hooks_basedir,
             hooks_socket_path,
         })

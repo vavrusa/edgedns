@@ -87,6 +87,9 @@ max_active_queries = 100000
 # Max number of clients waiting for a response to the same query
 max_clients_waiting_for_query = 1000
 
+# Max number of open upstream connections
+max_upstream_connections = 1000
+
 # Identity (optional) - Should be set to the name of the host
 # identity = "hostname"
 

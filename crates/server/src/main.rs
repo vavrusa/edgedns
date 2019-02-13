@@ -8,7 +8,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use clap::{App, Arg};
 use coarsetime::Instant;
 use env_logger;
-use libedgedns::{Cache, Conductor, Config, Context, TcpServer, UdpServer, Varz};
+use libedgedns::{Cache, Conductor, Config, Context, Server, Varz};
 use log::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +64,7 @@ fn main() {
     tokio::run_async(
         async move {
             let conductor = Arc::new(Conductor::from(&config));
-            let cache = Cache::new(&config, varz.clone());
+            let cache = Cache::from(&config);
             let context = Context::new(config.clone(), conductor, cache, varz.clone());
 
             // Graceful shutdown trigger
@@ -85,22 +85,15 @@ fn main() {
                     .take_until(tripwire.clone())
                     .for_each(move |_| {
                         Instant::update();
-                        varz.update_uptime();
                         Ok(())
                     })
                     .map_err(|e| eprintln!("failed to update time: {}", e)),
             );
 
-            // Start UDP acceptors
-            let server = UdpServer::new(context.clone(), config.max_active_queries);
+            // Start server
+            let server = Server::new(context.clone(), config.max_active_queries);
             if let Err(e) = server.spawn(tripwire.clone()) {
-                error!("error whilst starting a UDP server: {:?}", e)
-            }
-
-            // Start TCP acceptors
-            let server = TcpServer::new(context.clone(), config.max_active_queries);
-            if let Err(e) = server.spawn(tripwire.clone()) {
-                error!("error whilst starting a TCP server: {:?}", e)
+                error!("error whilst starting server: {:?}", e)
             }
 
             // Start the optional webservice

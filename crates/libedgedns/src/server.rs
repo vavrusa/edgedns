@@ -11,15 +11,15 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Error as IoError, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use stream_cancel::{StreamExt, Tripwire};
 use tokio::await;
 use tokio::codec::BytesCodec;
 use tokio::net::{TcpListener, TcpStream, UdpFramed, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
-use stream_cancel::{StreamExt, Tripwire};
 
 /// Initial buffer size for answers to cover minimal answers.
-const INITIAL_BUF_SIZE : usize = 128;
+const INITIAL_BUF_SIZE: usize = 256;
 
 /// Enum of used server protocols.
 #[derive(Clone, Copy, Debug)]
@@ -36,27 +36,40 @@ impl Default for Protocol {
     }
 }
 
-/// Server serving requests from a UDP socket.
-pub struct UdpServer {
+/// Server serving DNS requests.
+pub struct Server {
     context: Arc<Context>,
-    query_router: QueryRouter,
+    connections: Arc<EstablishedConnections>,
+    query_router: Arc<QueryRouter>,
     concurrency_limit: usize,
 }
 
-impl UdpServer {
+impl Server {
     pub fn new(context: Arc<Context>, concurrency_limit: usize) -> Self {
         Self {
-            query_router: QueryRouter::new(context.clone()),
+            query_router: Arc::new(QueryRouter::new(context.clone())),
+            connections: Arc::new(EstablishedConnections::default()),
             context,
             concurrency_limit,
         }
     }
 
-    pub async fn run(context: Arc<Context>, router: QueryRouter, socket: UdpSocket, tripwire: Tripwire) {
+    pub async fn run_udp(
+        context: Arc<Context>,
+        router: Arc<QueryRouter>,
+        socket: UdpSocket,
+        tripwire: Tripwire,
+    ) {
         let (mut sink, stream) = UdpFramed::new(socket, BytesCodec::new()).split();
         let mut stream = stream.take_until(tripwire);
         while let Some(Ok((msg, addr))) = await!(stream.next()) {
-            match await!(resolve_message(&context, &router, msg.into(), addr, Protocol::Udp)) {
+            match await!(resolve_message(
+                &context,
+                &router,
+                msg.into(),
+                addr,
+                Protocol::Udp
+            )) {
                 Ok(res) => match await!(sink.send(res)) {
                     Ok(res) => {
                         sink = res;
@@ -75,15 +88,19 @@ impl UdpServer {
         info!("udp server done");
     }
 
-    pub async fn run_concurrent(context: Arc<Context>, router: QueryRouter, socket: UdpSocket, tripwire: Tripwire) {
+    pub async fn run_udp_concurrent(
+        context: Arc<Context>,
+        router: Arc<QueryRouter>,
+        socket: UdpSocket,
+        tripwire: Tripwire,
+    ) {
         let (sink, stream) = UdpFramed::new(socket, BytesCodec::new()).split();
         let mut stream = stream.take_until(tripwire);
 
         // Create a channel for serializing messages from fan-out workers
         // The channel buffer size is set reasonably low to provide a backpressure,
         // so that if the executor is busy resolving queries, it shouldn't queue too many new ones.
-        let (mut sender, receiver) = mpsc::channel(context.config.udp_acceptor_threads);
-
+        let (sender, receiver) = mpsc::channel(context.config.udp_acceptor_threads);
         tokio::spawn(
             receiver
                 .map_err(move |_| ErrorKind::BrokenPipe.into())
@@ -96,29 +113,121 @@ impl UdpServer {
                 }),
         );
 
+        // Receive incoming messages and process asynchronously
         while let Some(Ok((msg, addr))) = await!(stream.next()) {
-            match await!(resolve_message(&context, &router, msg.into(), addr, Protocol::Udp)) {
-                Ok(res) => match await!(sender.send(res)) {
-                    Ok(res) => {
-                        sender = res;
-                    }
-                    Err(e) => {
-                        warn!("failed to send an answer back: {}", e);
-                        break;
+            let context = context.clone();
+            let router = router.clone();
+            let sender = sender.clone();
+            tokio::spawn_async(
+                async move {
+                    match await!(resolve_message(
+                        &context,
+                        &router,
+                        msg.into(),
+                        addr,
+                        Protocol::Udp
+                    )) {
+                        Ok(res) => {
+                            drop(await!(sender.send(res)));
+                        }
+                        Err(e) => {
+                            warn!("failed to generate an answer: {}", e);
+                        }
                     }
                 },
-                Err(e) => {
-                    warn!("failed to generate an answer: {}", e);
-                }
-            }
+            );
         }
 
         info!("udp server done");
     }
 
+    /// Process clients from a TCP listener.
+    pub async fn run_tcp(
+        context: Arc<Context>,
+        router: Arc<QueryRouter>,
+        connections: Arc<EstablishedConnections>,
+        listener: TcpListener,
+        tripwire: Tripwire,
+    ) {
+        let mut incoming = listener.incoming().take_until(tripwire);
+        while let Some(item) = await!(incoming.next()) {
+            // Check if the next client can be accepted
+            let stream = match item {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("can't accept tcp client, err {:?}", e);
+                    continue;
+                }
+            };
+
+            let peer_addr = stream.peer_addr().expect("tcp peer has address");
+            trace!("tcp client {} connected", peer_addr);
+
+            // Reuse TCP slots for each client identified by an IP address
+            // This is governed by the maximum TCP client count from the configuration.
+            // Each client gets a TCP slot allowance calculated as a portion of total TCP client count.
+            // If the TCP slot allowance for client is reached, the client's oldest open connection is recycled.
+            let (sender, receiver) = {
+                let mut connections = connections.lock();
+
+                // If the TCP client count is at maximum capacity, close an arbitrary client
+                if connections.len() >= context.config.max_tcp_clients {
+                    let key = *connections
+                        .keys()
+                        .next()
+                        .expect("full table must have a key");
+                    debug!("tcp client {}: forcing {} to close", peer_addr, key);
+                    if let Some(mut queue) = connections.remove(&key) {
+                        while let Some((_, mut stream)) = queue.pop_front() {
+                            drop(stream.close());
+                        }
+                    }
+                }
+
+                let max_per_client = context.config.max_tcp_clients / (connections.len() + 1);
+                let queue = connections.entry(peer_addr.ip()).or_default();
+
+                // Close connections exceeding the allowed count
+                while queue.len() >= max_per_client {
+                    if let Some((_, mut stream)) = queue.pop_front() {
+                        debug!("tcp client {}: closing previous connection", peer_addr);
+                        drop(stream.close());
+                    }
+                }
+
+                // Register new connection (port => message demultiplexer)
+                let (sender, receiver) = mpsc::channel(1);
+                queue.push_back((peer_addr.port(), sender.clone()));
+                (sender, receiver)
+            };
+
+            trace!("tcp client {} processing", peer_addr);
+            tokio::spawn_async(process_stream(
+                context.clone(),
+                router.clone(),
+                connections.clone(),
+                peer_addr,
+                stream,
+                sender,
+                receiver,
+            ));
+        }
+
+        info!("tcp server done");
+    }
+
     pub fn spawn(&self, tripwire: Tripwire) -> Result<()> {
         let socket_addr = self.context.config.listen_addr.parse::<SocketAddr>()?;
         let socket = create_udp_socket(socket_addr)?;
+
+        // Start the query router
+        let query_router = self.query_router.clone();
+        let tripwire_clone = tripwire.clone();
+        tokio::spawn_async(
+            async move {
+                await!(query_router.start(tripwire_clone));
+            },
+        );
 
         // Spawn a single concurrent handler with higher overhead, and the rest of fast-lane handlers.
         // This serves two purposes:
@@ -133,43 +242,26 @@ impl UdpServer {
             let router = self.query_router.clone();
             let tripwire = tripwire.clone();
             if i == acceptors - 1 {
-                tokio::spawn_async(UdpServer::run_concurrent(context, router, socket, tripwire));
+                tokio::spawn_async(Self::run_udp_concurrent(context, router, socket, tripwire));
             } else {
-                tokio::spawn_async(UdpServer::run(context, router, socket, tripwire));
+                tokio::spawn_async(Self::run_udp(context, router, socket, tripwire));
             }
         }
 
-        info!("udp bound to {}", socket_addr);
-        Ok(())
-    }
-}
-
-pub struct TcpServer {
-    context: Arc<Context>,
-    query_router: QueryRouter,
-    connections: Arc<EstablishedConnections>,
-    concurrency_limit: usize,
-}
-
-impl TcpServer {
-    pub fn new(context: Arc<Context>, concurrency_limit: usize) -> Self {
-        Self {
-            query_router: QueryRouter::new(context.clone()),
-            context,
-            connections: Arc::new(EstablishedConnections::default()),
-            concurrency_limit,
-        }
-    }
-
-    pub fn spawn(&self, tripwire: Tripwire) -> Result<()> {
-        let socket_addr = self.context.config.listen_addr.parse::<SocketAddr>()?;
+        // Spawn TCP acceptors
         let socket = TcpListener::bind(&socket_addr)?;
         let context = self.context.clone();
         let router = self.query_router.clone();
         let connections = self.connections.clone();
-        tokio::spawn_async(process_tcp_clients(context, router, connections, socket, tripwire));
+        tokio::spawn_async(Self::run_tcp(
+            context,
+            router,
+            connections,
+            socket,
+            tripwire.clone(),
+        ));
 
-        info!("tcp bound to {}", socket_addr);
+        info!("server bound to {}", socket_addr);
         Ok(())
     }
 }
@@ -178,81 +270,9 @@ impl TcpServer {
 /// A connection is represented by an atomic boolean that represents an open connection.
 type EstablishedConnections = Mutex<HashMap<IpAddr, VecDeque<(u16, mpsc::Sender<Bytes>)>>>;
 
-/// Process clients from a TCP listener.
-async fn process_tcp_clients(
-    context: Arc<Context>,
-    router: QueryRouter,
-    connections: Arc<EstablishedConnections>,
-    listener: TcpListener,
-    tripwire: Tripwire,
-) {
-    let mut incoming = listener.incoming().take_until(tripwire);
-    while let Some(item) = await!(incoming.next()) {
-        // Check if the next client can be accepted
-        let stream = match item {
-            Ok(stream) => stream,
-            Err(e) => {
-                warn!("can't accept tcp client, err {:?}", e);
-                continue
-            }
-        };
-
-        let peer_addr = stream.peer_addr().expect("tcp peer has address");
-        trace!("tcp client {} connected", peer_addr);
-
-        // Reuse TCP slots for each client identified by an IP address
-        // This is governed by the maximum TCP client count from the configuration.
-        // Each client gets a TCP slot allowance calculated as a portion of total TCP client count.
-        // If the TCP slot allowance for client is reached, the client's oldest open connection is recycled.
-        let (sender, receiver) = {
-            let mut connections = connections.lock();
-
-            // If the TCP client count is at maximum capacity, close an arbitrary client
-            if connections.len() >= context.config.max_tcp_clients {
-                let key = *connections.keys().next().expect("full table must have a key");
-                debug!("tcp client {}: forcing {} to close", peer_addr, key);
-                if let Some(mut queue) = connections.remove(&key) {
-                    while let Some((_, mut stream)) = queue.pop_front() {
-                        drop(stream.close());
-                    }
-                }
-            }
-
-            let max_per_client = context.config.max_tcp_clients / (connections.len() + 1);
-            let queue = connections.entry(peer_addr.ip()).or_default();
-
-            // Close connections exceeding the allowed count
-            while queue.len() >= max_per_client {
-                if let Some((_, mut stream)) = queue.pop_front() {
-                    debug!("tcp client {}: closing previous connection", peer_addr);
-                    drop(stream.close());
-                }
-            }
-
-            // Register new connection (port => message demultiplexer)
-            let (sender, receiver) = mpsc::channel(1);
-            queue.push_back((peer_addr.port(), sender.clone()));
-            (sender, receiver)
-        };
-
-        trace!("tcp client {} processing", peer_addr);
-        tokio::spawn_async(process_stream(
-            context.clone(),
-            router.clone(),
-            connections.clone(),
-            peer_addr,
-            stream,
-            sender,
-            receiver,
-        ));
-    }
-
-    info!("tcp server done");
-}
-
 async fn process_stream(
     context: Arc<Context>,
-    router: QueryRouter,
+    router: Arc<QueryRouter>,
     connections: Arc<EstablishedConnections>,
     peer_addr: SocketAddr,
     stream: TcpStream,
@@ -323,7 +343,7 @@ async fn process_stream(
 
 async fn process_message(
     context: Arc<Context>,
-    router: QueryRouter,
+    router: Arc<QueryRouter>,
     sender: mpsc::Sender<Bytes>,
     msg: Bytes,
     peer_addr: SocketAddr,
@@ -346,7 +366,7 @@ async fn process_message(
 
 pub async fn resolve_message<'a>(
     context: &'a Arc<Context>,
-    router: &'a QueryRouter,
+    router: &'a Arc<QueryRouter>,
     msg: Bytes,
     from: SocketAddr,
     protocol: Protocol,
@@ -357,7 +377,7 @@ pub async fn resolve_message<'a>(
         Ok(mut scope) => {
             scope.set_protocol(protocol);
             await!(router.resolve(scope, buf))
-        },
+        }
         Err(e) => Err(e),
     };
     // Generate a response

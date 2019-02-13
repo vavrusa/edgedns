@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::net::{tcp, TcpStream, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
+use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
 
 /// Default connection concurrency (number of outstanding requests for single connection)
 const DEFAULT_CONNECTION_CONCURRENCY: usize = 1000;
@@ -88,6 +89,8 @@ impl Conductor {
             Either::A(
                 self.exchanger
                     .exchange(scope, query, origin)
+                    .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
+                    .map_err(|_| IoError::new(ErrorKind::TimedOut, "timed out whilst waiting for upstreams"))
                     .and_then(|_| wait_response)
                     // Clear the pending query on exchange errors
                     .then(move |res| {
@@ -402,6 +405,7 @@ impl Exchanger for UdpExchanger {
         let pending = self.timetable.pending.clone();
         let selection = origin.get_scoped(&scope);
         let varz = scope.context.varz.clone();
+        let query_clone = query.clone();
         Box::new(
             // Iterate through all addresses in selection
             stream::iter_ok::<_, IoError>(selection.to_vec())
@@ -424,9 +428,21 @@ impl Exchanger for UdpExchanger {
                 // Finish the in-flight query
                 .fold(0, move |acc, res| {
                     if let Some((message, peer_addr)) = res {
-                        pending.finish(&message, &peer_addr);
+                        // Retry with TCP on truncation, otherwise finish
+                        if message.header().tc() {
+                            let pending = pending.clone();
+                            return Either::A(
+                                exchange_with_tcp(&peer_addr, query_clone.clone())
+                                    .and_then(move |(message, _stream)| {
+                                        pending.finish(&message, &peer_addr);
+                                        future::ok(acc + 1)
+                                    })
+                            );
+                        } else {
+                            pending.finish(&message, &peer_addr);
+                        }
                     }
-                    Ok::<_, IoError>(acc + 1)
+                    Either::B(future::ok::<_, IoError>(acc + 1))
                 })
                 // Return an error if no upstream is available
                 .and_then(move |num_results| {
@@ -684,9 +700,9 @@ fn exchange_with_open_connection(
         .and_then(move |_| {
             // First connection reuse doesn't know whether upstream supports it,
             // so the timeout is chosen more conservatively (double RTT).
-            let timeout = if fast_fallback && messages <= 1 {
-                // Estimate an upper bound for connection timeout as double of mean RTT
-                cmp::min(rtt * 2, DEFAULT_TIMEOUT)
+            let timeout = if fast_fallback && messages <= 100 {
+                // Estimate an upper bound for connection timeout as 150% of mean RTT
+                cmp::min((rtt * 3) / 2, DEFAULT_TIMEOUT)
             } else {
                 DEFAULT_TIMEOUT
             };
@@ -730,7 +746,11 @@ fn exchange_with_tcp(
     create_tcp_connection(addr)
         .timeout(DEFAULT_TIMEOUT)
         .map_err(move |_e| IoError::new(ErrorKind::TimedOut, "timed out whilst connecting"))
-        .map(tcp_framed_transport)
+        .map(move |stream| {
+            // Disable Nagle and convert to framed transport
+            drop(stream.set_nodelay(true));
+            tcp_framed_transport(stream)
+        })
         .and_then(move |stream| {
             stream
                 .send(query.as_slice().into())
@@ -760,17 +780,21 @@ fn exchange_with_udp(
     addr: SocketAddr,
     query: Message,
 ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
-    let socket = UdpSocket::bind(&"0.0.0.0:0".parse().unwrap()).expect("bound socket");
+    let local_addr = match addr.is_ipv6() {
+        true => "[::]:0".parse().unwrap(),
+        false => "0.0.0.0:0".parse().unwrap(),
+    };
+    let socket = UdpSocket::bind(&local_addr).expect("bound socket");
     udp_framed_transport(socket)
         .send((query.as_bytes().clone(), addr))
         .and_then(move |stream| {
             stream
                 // Filter only messages from requested target
                 .filter_map(move |(response, from)| {
-                    if from == addr {
+                    if from.ip() == addr.ip() {
                         Some(response)
                     } else {
-                        info!("skipping unsolicited response from {}", from);
+                        info!("skipping unsolicited response from {} (expected: {})", from, addr);
                         None
                     }
                 })

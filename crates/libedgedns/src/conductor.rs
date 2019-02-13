@@ -321,7 +321,7 @@ impl Exchanger for TcpExchanger {
                 // Attempt to do a message exchange
                 let duration = Instant::now();
                 exchange_with_tcp(&addr, query_clone.clone()).then(move |res| match res {
-                    Ok((message, stream)) => Ok(Some((message, stream, duration.elapsed()))),
+                    Ok((message, stream)) => Ok(Some((message, stream, addr, duration.elapsed()))),
                     Err(e) => {
                         info!("error while talking to {}: {}", addr, e);
                         Ok(None)
@@ -334,11 +334,7 @@ impl Exchanger for TcpExchanger {
             .take(1)
             // Finish the in-flight query
             .fold(0, move |acc, res| {
-                if let Some((message, mut stream, elapsed)) = res {
-                    let peer_addr = stream
-                        .get_ref()
-                        .peer_addr()
-                        .expect("tcp connection must have a peer address");
+                if let Some((message, mut stream, peer_addr, elapsed)) = res {
                     // Save connection if connection reuse is enabled
                     if exchanger.connection_reuse {
                         // Save connection in pending queue
@@ -350,6 +346,7 @@ impl Exchanger for TcpExchanger {
                             tokio::spawn(keep_open_connection(
                                 exchanger.timetable.clone(),
                                 stream,
+                                peer_addr,
                                 exchanger.connection_concurrency,
                                 receiver,
                             ));
@@ -614,15 +611,10 @@ impl From<&Arc<Config>> for Conductor {
 fn keep_open_connection(
     timetable: Timetable,
     stream: FramedStream,
+    peer_addr: SocketAddr,
     concurrency: usize,
     receiver: ConnectionReceiver,
 ) -> impl Future<Item = (), Error = ()> {
-    // Save connection in pending queue
-    let peer_addr = stream
-        .get_ref()
-        .peer_addr()
-        .expect("tcp connection must have a peer address");
-
     // Create a token bucket with channel to limit concurrency of the connection
     // In order to start new queries, there must be a token in the channel.
     // When a query is completed, it returns tokens into the channel.

@@ -116,7 +116,7 @@ impl Recursor {
                     let cache_key = CacheKey::from(&msg);
                     let cached_response = match cache {
                         Some(ref mut cache) => {
-                            cache.get(&cache_key).and_then(|e| Some(e.as_message()))
+                            cache.get(&cache_key).and_then(move |e| Some(e.as_message()))
                         }
                         None => None,
                     };
@@ -163,7 +163,7 @@ impl Recursor {
                     match response {
                         Ok((msg, from)) => request.consume(msg.as_slice(), from),
                         Err(e) => {
-                            warn!("error when resolving query with origin: {:?}", e);
+                            info!("error when resolving query with origin: {:?}", e);
                             request.consume(&[], first_address)
                         }
                     }

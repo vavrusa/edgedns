@@ -24,7 +24,7 @@ stream-cancel = "0.4"
 jumphash = {git = "https://github.com/jedisct1/rust-jumphash"}
 tokio = {version = "0.1.15", features=["async-await-preview"]}
 domain-core = {git = "https://github.com/vavrusa/domain-core", rev = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}
-kres = {git = "https://github.com/vavrusa/rust-kres", rev = "4edff88ba20a58527891978d0a2d792920dfe923"}
+kres = {git = "https://github.com/vavrusa/rust-kres", rev = "4d9348eec4bc64f91f5fed3d3b91775cca1f7dc8"}
 parking_lot = {version = "0.7"}
 clockpro-cache = {version = "0.1.7"}
 prometheus = "*"

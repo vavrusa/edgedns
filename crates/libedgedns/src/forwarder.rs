@@ -1,6 +1,7 @@
 use crate::conductor::Origin;
 use crate::config::Config;
 use crate::query_router::Scope;
+use crate::context::Context;
 use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
 use domain_core::bits::Message;
 use jumphash::JumpHasher;
@@ -10,6 +11,7 @@ use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use stream_cancel::Tripwire;
 use tokio::prelude::*;
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
@@ -32,6 +34,11 @@ pub struct Forwarder {
 }
 
 impl Forwarder {
+    pub async fn start(&self, _context: Arc<Context>, _tripwire: Tripwire) -> Result<(), Error> {
+        // TODO: start healthcheck
+        Ok(())
+    }
+
     pub fn resolve(&self, scope: &Scope) -> impl Future<Item = Message, Error = Error> {
         let conductor = scope.context.conductor.clone();
         conductor

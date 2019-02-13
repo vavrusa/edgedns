@@ -43,10 +43,9 @@ pub fn test_context() -> Arc<Context> {
     config.upstream_max_failure_duration = Duration::from_millis(2500);
 
     let config = Arc::new(config);
-
-    let conductor = Conductor::new();
-    let cache = Cache::new(&config, VARZ.clone());
-    Context::new(config.clone(), conductor, cache, VARZ.clone())
+    let conductor = Arc::new(Conductor::from(&config));
+    let cache = Cache::from(&config);
+    Context::new(config, conductor, cache, VARZ.clone())
 }
 
 /// Create an echo server (UDP and TCP) and return the listener address, and the server future

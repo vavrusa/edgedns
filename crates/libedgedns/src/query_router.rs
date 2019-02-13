@@ -1,4 +1,4 @@
-use crate::cache::{CacheKey, CacheEntry};
+use crate::cache::{CacheEntry, CacheKey};
 use crate::config::ServerType;
 use crate::context::Context;
 use crate::error::Result;
@@ -15,6 +15,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use stream_cancel::Tripwire;
 use tokio::await;
 
 #[derive(Clone)]
@@ -67,7 +68,7 @@ pub struct QueryRouter {
 impl QueryRouter {
     pub fn new(context: Arc<Context>) -> Self {
         let config = &context.config;
-        
+
         Self {
             router: match config.server_type {
                 ServerType::Recursive => QueryRouterVariant::Recursor(Recursor::new(config)),
@@ -76,6 +77,18 @@ impl QueryRouter {
                 }
             },
             context,
+        }
+    }
+
+    pub async fn start(&self, tripwire: Tripwire) {
+        debug!("starting query router");
+        let context = self.context.clone();
+        let result = match &self.router {
+            QueryRouterVariant::Recursor(recursor) => await!(recursor.start(context, tripwire)),
+            QueryRouterVariant::Forwarder(forwarder) => await!(forwarder.start(context, tripwire)),
+        };
+        if let Err(e) = result {
+            warn!("failed to start query router: {:?}", e);
         }
     }
 
@@ -98,18 +111,18 @@ impl QueryRouter {
         match scope.protocol {
             Protocol::Udp => self.context.varz.client_queries_udp.inc(),
             Protocol::Tcp => self.context.varz.client_queries_tcp.inc(),
-            _ => {},
+            _ => {}
         }
 
         // TODO: Process pre-flight hooks
-       
+
         let mut cache = self.context.cache.clone();
         let cache_key = CacheKey::from(&scope);
         let answer = match cache.get(&cache_key) {
             Some(entry) => {
                 self.context.varz.client_queries_cached.inc();
                 resolve_from_cache(&scope, entry, answer)
-            },
+            }
             None => {
                 // Route the request to respective handler
                 let res = match &self.router {
@@ -144,7 +157,12 @@ lazy_static! {
     static ref DNAME_SERVER: Dname = Dname::from_str("server.").unwrap();
 }
 
-fn resolve_from_answer(scope: &Scope, source: Message, answer: BytesMut, elapsed: Option<u32>) -> Result<BytesMut> {
+fn resolve_from_answer(
+    scope: &Scope,
+    source: Message,
+    answer: BytesMut,
+    elapsed: Option<u32>,
+) -> Result<BytesMut> {
     // Check server type to alter cached message processing
     let server_type = scope.context.config.server_type;
 
@@ -195,7 +213,7 @@ fn resolve_from_answer(scope: &Scope, source: Message, answer: BytesMut, elapsed
         if let Ok(Some(mut rr)) = rr.into_record::<AllRecordData<ParsedDname>>() {
             // Decay TTL if configured
             if elapsed.is_some() && server_type != ServerType::Authoritative {
-                rr.set_ttl(rr.ttl().saturating_sub(elapsed.unwrap()));    
+                rr.set_ttl(rr.ttl().saturating_sub(elapsed.unwrap()));
             }
             return Some(rr);
         }
@@ -208,11 +226,11 @@ fn resolve_from_answer(scope: &Scope, source: Message, answer: BytesMut, elapsed
         Ok(message) => {
             // TODO: add OPT before finalizing
             Ok(message.finish())
-        },
+        }
         Err(_) => {
             // Truncation occured, return error
             resolve_to_error(scope, answer, src_header.rcode(), true)
-        },
+        }
     }
 }
 
@@ -270,7 +288,12 @@ fn resolve_to_chaos(scope: &Scope, answer: BytesMut) -> Result<BytesMut> {
 }
 
 /// Fallback handler to resolve errors into error responses
-fn resolve_to_error(scope: &Scope, answer: BytesMut, rcode: Rcode, truncated: bool) -> Result<BytesMut> {
+fn resolve_to_error(
+    scope: &Scope,
+    answer: BytesMut,
+    rcode: Rcode,
+    truncated: bool,
+) -> Result<BytesMut> {
     // TODO: reuse header and opt building code
     let mut message = MessageBuilder::from_buf(answer);
     let header = message.header_mut();
@@ -279,7 +302,7 @@ fn resolve_to_error(scope: &Scope, answer: BytesMut, rcode: Rcode, truncated: bo
     header.set_qr(true);
     header.set_rcode(rcode);
     header.set_tc(truncated);
-    if  message.push(scope.question.clone()).is_err() {
+    if message.push(scope.question.clone()).is_err() {
         return Err(ErrorKind::UnexpectedEof.into());
     }
 

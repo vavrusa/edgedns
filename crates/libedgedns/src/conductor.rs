@@ -2,6 +2,7 @@ use crate::cache::CacheKey;
 use crate::codecs::*;
 use crate::config::{Config, ServerType};
 use crate::query_router::Scope;
+use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
 use domain_core::bits::*;
 use futures::future::Either;
 use futures::stream::Stream;
@@ -20,7 +21,6 @@ use std::time::{Duration, Instant};
 use tokio::net::{tcp, TcpStream, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
-use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
 
 /// Default connection concurrency (number of outstanding requests for single connection)
 const DEFAULT_CONNECTION_CONCURRENCY: usize = 1000;
@@ -90,7 +90,12 @@ impl Conductor {
                 self.exchanger
                     .exchange(scope, query, origin)
                     .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
-                    .map_err(|_| IoError::new(ErrorKind::TimedOut, "timed out whilst waiting for upstreams"))
+                    .map_err(|_| {
+                        IoError::new(
+                            ErrorKind::TimedOut,
+                            "timed out whilst waiting for upstreams",
+                        )
+                    })
                     .and_then(|_| wait_response)
                     // Clear the pending query on exchange errors
                     .then(move |res| {
@@ -171,7 +176,7 @@ impl Timetable {
             Some(ref mut c) => {
                 c.update(expected_rtt);
                 false
-            },
+            }
             None => {
                 // Insert a new connection tracker if not exists
                 connections.insert(address, ConnectionTracker::new(sink, expected_rtt));
@@ -338,7 +343,10 @@ impl Exchanger for TcpExchanger {
                     if exchanger.connection_reuse {
                         // Save connection in pending queue
                         let (sender, receiver) = mpsc::channel(exchanger.connection_concurrency);
-                        if exchanger.timetable.add_open_connection(peer_addr, sender, elapsed) {
+                        if exchanger
+                            .timetable
+                            .add_open_connection(peer_addr, sender, elapsed)
+                        {
                             tokio::spawn(keep_open_connection(
                                 exchanger.timetable.clone(),
                                 stream,
@@ -432,11 +440,12 @@ impl Exchanger for UdpExchanger {
                         if message.header().tc() {
                             let pending = pending.clone();
                             return Either::A(
-                                exchange_with_tcp(&peer_addr, query_clone.clone())
-                                    .and_then(move |(message, _stream)| {
+                                exchange_with_tcp(&peer_addr, query_clone.clone()).and_then(
+                                    move |(message, _stream)| {
                                         pending.finish(&message, &peer_addr);
                                         future::ok(acc + 1)
-                                    })
+                                    },
+                                ),
                             );
                         } else {
                             pending.finish(&message, &peer_addr);
@@ -687,7 +696,11 @@ fn exchange_with_open_connection(
     fast_fallback: bool,
 ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
     let (tx, rx) = oneshot::channel();
-    let (rtt, messages, sender) = (connection.mean_rtt(), connection.messages, connection.sender);
+    let (rtt, messages, sender) = (
+        connection.mean_rtt(),
+        connection.messages,
+        connection.sender,
+    );
     sender
         .send((query, tx))
         .map_err(move |e| {
@@ -794,7 +807,10 @@ fn exchange_with_udp(
                     if from.ip() == addr.ip() {
                         Some(response)
                     } else {
-                        info!("skipping unsolicited response from {} (expected: {})", from, addr);
+                        info!(
+                            "skipping unsolicited response from {} (expected: {})",
+                            from, addr
+                        );
                         None
                     }
                 })

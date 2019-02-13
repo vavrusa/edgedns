@@ -1,33 +1,35 @@
+use crate::cache::{Cache, CacheKey};
 use crate::conductor::Origin;
 use crate::config::Config;
+use crate::context::Context;
 use crate::query_router::Scope;
+use crate::{HEALTH_CHECK_MS, UPSTREAM_TOTAL_TIMEOUT_MS};
+use bytes::Bytes;
 use domain_core::bits::*;
 use domain_core::iana::*;
 use domain_core::rdata::*;
-use futures::future::Either;
 use hex;
 use kres;
 use log::*;
-use std::io::{Error as IoError, ErrorKind, Result};
-use std::net::SocketAddr;
+use std::io::{ErrorKind, Result};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use stream_cancel::{StreamExt, Tripwire};
 use tokio::await;
 use tokio::prelude::*;
+use tokio::timer::Interval;
 
 #[derive(Clone)]
 pub struct Recursor {
     resolver: Arc<kres::Context>,
+    cache: Option<Cache>,
 }
 
 impl Recursor {
     pub fn new(config: &Config) -> Self {
         Builder::default()
-            .with_cache(if config.cache_size > 1024 {
-                1024 * 1024
-            } else {
-                0
-            })
+            .with_cache(config.cache_size)
             .with_trust_anchor(Ds::new(
                 20326,
                 SecAlg::RsaSha256,
@@ -36,14 +38,15 @@ impl Recursor {
                     .unwrap()
                     .into(),
             ))
-            .with_verbosity(log_enabled!(Level::Info))
+            .with_verbosity(log_enabled!(Level::Trace))
             .build()
     }
 
     fn from_builder(builder: &Builder) -> Self {
-        let resolver = match builder.cache_size {
-            0 => kres::Context::new(),
-            _ => kres::Context::with_cache(".", builder.cache_size).unwrap(),
+        let resolver = kres::Context::new();
+        let cache = match builder.cache_size {
+            0 => None,
+            _ => Some(Cache::new(builder.cache_size, 0, 10_800)),
         };
 
         for ta in &builder.trust_anchors {
@@ -53,11 +56,48 @@ impl Recursor {
         }
 
         resolver.set_verbose(builder.verbose);
-        Self { resolver }
+        Self { resolver, cache }
     }
 
-    pub async fn resolve_async<'a>(&'a self, scope: &'a Scope) -> Result<Message> {
+    pub async fn start(&self, context: Arc<Context>, tripwire: Tripwire) -> Result<()> {
+        let healthcheck = Duration::from_millis(HEALTH_CHECK_MS);
+        let mut interval = Interval::new(Instant::now(), healthcheck).take_until(tripwire);
+
+        // Construct priming query
+        let source = "127.0.0.1:0".parse::<SocketAddr>().expect("local addr");
+        let msg: Bytes = {
+            let mut b = MessageBuilder::with_capacity(512);
+            b.header_mut().set_rd(true);
+            b.push(Question::new(Dname::root(), Rtype::Ns, Class::In))
+                .expect("pushed question");
+            b.finish().into()
+        };
+
+        // Poll root servers for healthcheck
+        while let Some(_) = await!(interval.next()) {
+            let scope = Scope::new(context.clone(), msg.clone(), source).unwrap();
+            let start = Instant::now();
+            match await!(self.resolve(&scope)) {
+                Ok(msg) => {
+                    debug!(
+                        "polled root servers in {:?}: {}",
+                        start.elapsed(),
+                        msg.header().rcode()
+                    );
+                }
+                Err(e) => {
+                    info!("root servers unreachable: {:?}", e);
+                }
+            }
+        }
+
+        info!("recursor healthcheck stopped");
+        Ok(())
+    }
+
+    pub async fn resolve<'a>(&'a self, scope: &'a Scope) -> Result<Message> {
         let request = kres::Request::new(self.resolver.clone());
+        let mut cache = self.cache.clone();
         let scope = scope.clone();
 
         // Push it as a question to request
@@ -70,15 +110,58 @@ impl Recursor {
                 Some((buf, addresses)) => {
                     // Save first address in case of an error
                     let first_address = addresses[0];
+                    let msg = Message::from_bytes(buf).unwrap();
+
+                    // Check infrastructure cache first
+                    let cache_key = CacheKey::from(&msg);
+                    let cached_response = match cache {
+                        Some(ref mut cache) => {
+                            cache.get(&cache_key).and_then(|e| Some(e.as_message()))
+                        }
+                        None => None,
+                    };
+
                     // Resolve the query with the origin list
-                    let origin = Arc::new(PreferenceList { addresses });
-                    let res = await!(conductor
-                        .resolve(scope.clone(), Message::from_bytes(buf).unwrap(), origin)
-                        .timeout(Duration::from_millis(3000)));
+                    let response = match cached_response {
+                        Some(msg) => {
+                            // Cache response has no source address specified
+                            let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+                            Ok((msg, from))
+                        }
+                        None => {
+                            let origin = Arc::new(PreferenceList { addresses });
+                            let response = await!(conductor
+                                .resolve(scope.clone(), msg, origin)
+                                .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / 2)));
+
+                            // Update infrastructure cache
+                            if let Some(ref mut cache) = cache {
+                                if let Ok((ref msg, ..)) = response {
+                                    // Only accept valid responses (not SERVFAIL)
+                                    let is_valid = {
+                                        let hdr = msg.header();
+                                        hdr.qr() && hdr.rcode() != Rcode::ServFail
+                                    };
+                                    // Only accept NS type responses, or responses that are authoritative
+                                    // e.g. not referrals, as it may be a different answer within the same zone cut
+                                    let is_infrastructure = match msg.first_question() {
+                                        Some(q) => q.qtype() == Rtype::Ns || msg.header().aa(),
+                                        None => false,
+                                    };
+                                    // TODO: avoid inserting final response
+                                    if is_valid && is_infrastructure {
+                                        cache.insert(cache_key, msg.clone().into());
+                                    }
+                                }
+                            }
+
+                            response
+                        }
+                    };
 
                     // Consume the mock answer and expect resolution to be done
-                    match res {
-                        Ok((message, from)) => request.consume(message.as_slice(), from),
+                    match response {
+                        Ok((msg, from)) => request.consume(msg.as_slice(), from),
                         Err(e) => {
                             warn!("error when resolving query with origin: {:?}", e);
                             request.consume(&[], first_address)
@@ -95,74 +178,6 @@ impl Recursor {
             Ok(resp) => Ok(resp),
             Err(_) => Err(ErrorKind::InvalidData.into()),
         }
-    }
-
-    pub fn resolve(&self, scope: &Scope) -> impl Future<Item = Message, Error = IoError> {
-        let request = kres::Request::new(self.resolver.clone());
-        let scope = scope.clone();
-
-        // Push it as a question to request
-        let state = request.consume(scope.query.as_bytes(), scope.peer_addr);
-        let fut = if state != kres::State::PRODUCE {
-            Either::A(future::ok((state, request)))
-        } else {
-            let conductor = scope.context.conductor.clone();
-            Either::B(future::loop_fn(request, move |request| {
-                match request.produce() {
-                    Some((buf, addresses)) => {
-                        // Save first address in case of an error
-                        let first_address = addresses[0];
-                        // Resolve the query with the origin list
-                        let origin = Arc::new(PreferenceList { addresses });
-                        Either::A(
-                            conductor
-                                .resolve(scope.clone(), Message::from_bytes(buf).unwrap(), origin)
-                                .timeout(Duration::from_millis(3000))
-                                .then(move |res| {
-                                    let state = match res {
-                                        Ok((message, from)) => {
-                                            debug!(
-                                                "received response for '{:?}'",
-                                                message.first_question()
-                                            );
-                                            request.consume(message.as_slice(), from)
-                                        }
-                                        Err(e) => {
-                                            info!(
-                                                "error when resolving query with origin: {:?}",
-                                                e
-                                            );
-                                            request.consume(&[], first_address)
-                                        }
-                                    };
-
-                                    Ok((state, request))
-                                })
-                                .and_then(move |(state, request)| {
-                                    if state == kres::State::PRODUCE {
-                                        Ok(future::Loop::Continue(request))
-                                    } else {
-                                        Ok(future::Loop::Break((state, request)))
-                                    }
-                                }),
-                        )
-                    }
-                    None => Either::B(future::ok(future::Loop::Break((
-                        kres::State::DONE,
-                        request,
-                    )))),
-                }
-            }))
-        };
-
-        // Get final answer
-        fut.and_then(move |(state, request)| {
-            let buf = request.finish(state).unwrap();
-            match Message::from_bytes(buf) {
-                Ok(resp) => Ok(resp),
-                Err(_) => Err(ErrorKind::InvalidData.into()),
-            }
-        })
     }
 }
 
@@ -253,45 +268,10 @@ mod test {
                 async move {
                     for _ in 1..1000 {
                         let scope = Scope::new(context.clone(), msg.clone(), peer_addr).unwrap();
-                        black_box(await!(rec.resolve_async(&scope)).expect("result"));
+                        black_box(await!(rec.resolve(&scope)).expect("result"));
                     }
                 },
             );
-        };
-
-        // Warmup and test
-        bench_closure();
-        b.iter(bench_closure);
-    }
-
-    #[bench]
-    fn resolve_1k_future(b: &mut Bencher) {
-        let context = test_context();
-
-        // Build a default recursor
-        let rec = Builder::default().build();
-
-        // Create a query that will be immediately solved
-        let peer_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
-        let msg: Bytes = {
-            let mut mb = MessageBuilder::with_capacity(512);
-            mb.push(Question::new(
-                Dname::from_slice(b"\0").unwrap(),
-                Rtype::Any,
-                Class::Ch,
-            ))
-            .expect("pushed question");
-            mb.finish().into()
-        };
-
-        let mut runtime = Runtime::new().expect("runtime");
-        let mut bench_closure = || {
-            let rec = rec.clone();
-            let msg = msg.clone();
-            for _ in 1..1000 {
-                let scope = Scope::new(context.clone(), msg.clone(), peer_addr).unwrap();
-                black_box(runtime.block_on(rec.resolve(&scope)).expect("result"));
-            }
         };
 
         // Warmup and test

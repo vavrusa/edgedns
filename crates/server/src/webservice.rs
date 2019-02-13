@@ -34,10 +34,10 @@ impl WebService {
                 match (req.method(), req.uri().path()) {
                     // Serve metrics
                     (&Method::GET, "/metrics") => {
+                        // Update uptime
+                        context.varz.update_uptime();
                         // Update lazily calculated metrics
                         let cache_stats = context.cache.stats();
-                        context.varz.cache_hits.set(cache_stats.hits as f64);
-                        context.varz.cache_misses.set(cache_stats.misses as f64);
                         context.varz.cache_inserted.set(cache_stats.inserted as f64);
                         context.varz.cache_evicted.set(cache_stats.evicted as f64);
                         context
@@ -49,7 +49,6 @@ impl WebService {
                             .varz
                             .cache_frequent_len
                             .set(cache_stats.frequent_len as f64);
-                        // TODO: update uptime
 
                         // Render metrics in Prometheus format
                         let metric_families = prometheus::gather();

@@ -12,8 +12,6 @@ pub struct StartInstant(pub Instant);
 pub struct Inner {
     pub start_instant: StartInstant,
     pub uptime: Gauge,
-    pub cache_hits: Gauge,
-    pub cache_misses: Gauge,
     pub cache_frequent_len: Gauge,
     pub cache_recent_len: Gauge,
     pub cache_test_len: Gauge,
@@ -45,18 +43,6 @@ impl Inner {
             uptime: register_gauge!(opts!(
                 "edgedns_uptime",
                 "Uptime",
-                labels! {"handler" => "all",}
-            ))
-            .unwrap(),
-            cache_hits: register_gauge!(opts!(
-                "edgedns_cache_hits",
-                "Number of cache lookup hits",
-                labels! {"handler" => "all",}
-            ))
-            .unwrap(),
-            cache_misses: register_gauge!(opts!(
-                "edgedns_cache_misses",
-                "Number of cache lookup misses",
                 labels! {"handler" => "all",}
             ))
             .unwrap(),

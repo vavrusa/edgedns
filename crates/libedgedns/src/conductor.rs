@@ -2,31 +2,39 @@ use crate::cache::CacheKey;
 use crate::codecs::*;
 use crate::config::{Config, ServerType};
 use crate::query_router::Scope;
+use crate::varz::Varz;
 use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
+use clockpro_cache::*;
 use domain_core::bits::*;
 use futures::future::Either;
 use futures::stream::Stream;
 use futures::sync::{mpsc, oneshot};
+use lazy_static::lazy_static;
 use log::*;
 use parking_lot::RwLock;
 use socket2::{Domain, Socket, Type};
 use std::cmp;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 use std::io::{Error as IoError, ErrorKind};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::slice::Iter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{tcp, TcpStream, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
-use clockpro_cache::*;
 
 /// Default connection concurrency (number of outstanding requests for single connection)
 const DEFAULT_CONNECTION_CONCURRENCY: usize = 1000;
 /// Default keepalive interval for idle connections
 const DEFAULT_KEEPALIVE: Duration = Duration::from_millis(10_000);
+
+lazy_static! {
+    static ref UNBOUND_IPV4: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+    static ref UNBOUND_IPV6: IpAddr = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0));
+}
 
 /// Origin trait provides and interface to return a selection addresses for conductor.
 /// The implementations of the trait define the order and size of the slice
@@ -68,62 +76,45 @@ impl Conductor {
         query: Message,
         origin: Arc<Origin>,
     ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
-        let varz = scope.context.varz.clone();
-
-        // Create a waitable future for the query result
-        let (tx, rx) = oneshot::channel();
-        let wait_response = rx
-            .map_err(|_| IoError::new(ErrorKind::UnexpectedEof, "cannot receive a query response"))
-            // TODO: make ExchangeFuture a type and implement cleanup on Drop
-            .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::TimedOut,
-                    "timed out whilst waiting for upstreams",
-                )
-            })
-            .into_future();
-
         // If the query is already being solved, register a waitable future
         let key = CacheKey::from(&query);
-        let pending = self.timetable.pending.clone();
 
-        // First query creates a queue for other same queries
-        let queue_len = self.timetable.pending.start(&key, tx);
-        if queue_len == 1 {
-            debug!("registered query '{}'", key);
-            varz.upstream_inflight_queries.inc();
-            let start_timer = varz.upstream_rtt.start_timer();
-            Either::A(
-                self.exchanger
-                    .exchange(scope, query, origin)
-                    .and_then(|_| wait_response)
-                    // Clear the pending query on exchange errors
-                    .then(move |res| {
-                        drop(start_timer);
-                        varz.upstream_inflight_queries.dec();
-                        match res {
-                            Ok((msg, from)) => {
-                                varz.upstream_response_sizes.observe(msg.len() as f64);
-                                varz.upstream_received.inc();
-                                Ok((msg, from))
-                            }
-                            Err(e) => {
-                                trace!("error in resolve: {:?}", e);
-                                varz.upstream_timeout.inc();
-                                pending.clear(&key);
-                                Err(e)
-                            }
-                        }
-                    }),
-            )
-        } else {
-            debug!("enqueued query '{}' ({} waiting)", key, queue_len);
-            Either::B(wait_response)
+        // Retry until a query is either started or enqueued
+        loop {
+            // First query creates a queue for other same queries
+            if let Some(queue) = self.timetable.start_query(&scope, &key) {
+                debug!("starting query '{}'", key);
+                return Either::A(
+                    self.exchanger
+                        .exchange(scope, query, origin)
+                        // Clear the pending query on exchange errors
+                        .and_then(move |(msg, from)| {
+                            queue.finish(&msg, &from);
+                            Ok((msg, from))
+                        })
+                );
+            } else {
+                // Create a waitable future for the query result
+                trace!("enqueueing query '{}'", key);
+                let (tx, rx) = oneshot::channel();
+                let wait_response = rx
+                    .map_err(|_| {
+                        IoError::new(ErrorKind::UnexpectedEof, "cannot receive a query response")
+                    })
+                    .into_future();
+
+                if !self.timetable.enqueue_query(&key, tx) {
+                    continue;
+                }
+
+                // Enqueue to an already pending query
+                return Either::B(wait_response);
+            }
         }
     }
 
-    pub fn process_list(&self, f: &mut String) {
+    /// Format a table of pending queries.
+    pub fn pending_queries(&self, f: &mut String) {
         let pending_guard = self.timetable.pending.inner.write();
         for (key, ticket_list) in &*pending_guard {
             writeln!(f, "{}\t{} waiting", key, ticket_list.len()).unwrap();
@@ -132,7 +123,7 @@ impl Conductor {
 }
 
 /// Future result of the [`Exchanger`].
-type ExchangeFuture = Box<Future<Item = (), Error = IoError> + Send>;
+type ExchangeFuture = Box<Future<Item = (Message, SocketAddr), Error = IoError> + Send>;
 
 /// Exchanger trait provides an interface for performing message exchanges.
 trait Exchanger: Send + Sync {
@@ -147,6 +138,21 @@ struct Timetable {
 }
 
 impl Timetable {
+    /// Register a query identified by `key` as pending, and add `sink` to the queue of waiting futures.
+    /// Note: The function returns a handle that closes when the pending query when it goes out of scope.
+    fn start_query(&self, scope: &Scope, key: &CacheKey) -> Option<PendingQuery> {
+        if self.pending.start(&key) {
+            Some(PendingQuery::new(key.clone(), self.pending.clone(), scope))
+        } else {
+            None
+        }
+    }
+
+    /// Enqueue waiting query for an already start query.
+    fn enqueue_query(&self, key: &CacheKey, sink: ResponseSender) -> bool {
+        self.pending.enqueue(key, sink)
+    }
+
     /// Returns an open connection for an address from the given list (if exists).
     fn find_open_connection(&self, addresses: &[SocketAddr]) -> Option<ConnectionTracker> {
         let mut connections = self.connections.write();
@@ -193,6 +199,51 @@ impl Timetable {
     }
 }
 
+/// Reference for a single pending query.
+/// It clears itself from context on drop.
+struct PendingQuery {
+    context: Arc<PendingQueries>,
+    key: Option<CacheKey>,
+    varz: Varz,
+    _timer: prometheus::HistogramTimer,
+}
+
+impl PendingQuery {
+    fn new(key: CacheKey, context: Arc<PendingQueries>, scope: &Scope) -> Self {
+        let varz = scope.context.varz.clone();
+        varz.upstream_inflight_queries.inc();
+        let _timer = varz.upstream_rtt.start_timer();
+        Self {
+            context,
+            key: Some(key),
+            varz,
+            _timer,
+        }
+    }
+
+    // Finish enqueued queries waiting for this response.
+    fn finish(mut self, resp: &Message, peer_addr: &SocketAddr) {
+        if let Some(key) = self.key.take() {
+            trace!("finishing pending query '{}'", key);
+            self.context.finish(&key, resp, peer_addr);
+            self.varz.upstream_response_sizes.observe(resp.len() as f64);
+            self.varz.upstream_received.inc();
+        }
+        drop(self);
+    }
+}
+
+impl Drop for PendingQuery {
+    fn drop(&mut self) {
+        self.varz.upstream_inflight_queries.dec();
+        if let Some(key) = self.key.take() {
+            trace!("closing pending query '{}' without response", key);
+            self.varz.upstream_timeout.inc();
+            self.context.clear(&key);
+        }
+    }
+}
+
 /// Structure tracks pending queries represented by [`CacheKey`] to a queue of waiting futures.
 /// The primary purpose is coalescing of outbound queries over the same circuit.
 #[derive(Default)]
@@ -210,7 +261,19 @@ impl PendingQueries {
     }
 
     /// Register a query identified by `key` as pending, and add `sink` to the queue of waiting futures.
-    pub fn start(&self, key: &CacheKey, sink: ResponseSender) -> usize {
+    pub fn start(&self, key: &CacheKey) -> bool {
+        let mut locked = self.inner.write();
+        match locked.entry(key.clone()) {
+            Occupied(_) => false,
+            Vacant(entry) => {
+                entry.insert(VecDeque::new());
+                true
+            }
+        }
+    }
+
+    /// Enqueue a query in a queue of same queries waiting for response.
+    pub fn enqueue(&self, key: &CacheKey, sink: ResponseSender) -> bool {
         let mut locked = self.inner.write();
         match locked.get_mut(&key) {
             Some(v) => {
@@ -220,20 +283,15 @@ impl PendingQueries {
                     v.pop_front();
                 }
                 v.push_back(sink);
-                v.len()
+                true
             }
-            None => {
-                let mut v = VecDeque::with_capacity(1);
-                v.push_back(sink);
-                locked.insert(key.clone(), v);
-                1
-            }
+            // Pending query closed before enqueuing, caller must retry
+            None => false,
         }
     }
 
     /// Send the message to the queue of futures waiting for completion, and clear the message from the wait list.
-    pub fn finish(&self, resp: &Message, peer_addr: &SocketAddr) -> usize {
-        let key = CacheKey::from(resp);
+    pub fn finish(&self, key: &CacheKey, resp: &Message, peer_addr: &SocketAddr) -> usize {
         let mut locked = self.inner.write();
         match locked.remove(&key) {
             Some(sinks) => {
@@ -307,38 +365,49 @@ struct TcpExchanger {
     connection_reuse: bool,
     connection_reuse_fallback: bool,
     connection_concurrency: usize,
+    with_udp_fallback: bool,
 }
 
 impl Exchanger for TcpExchanger {
     fn exchange(&self, scope: Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
         let selection = origin.get_scoped(&scope);
-        let num_choices = selection.len();
+        let first_address = selection.first().cloned();
+        // TODO: track average RTTs of connections in timetable
+        let exchange_timeout =
+            Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / (selection.len() + 1) as u64);
 
         // Clone inner variables because Futures 0.1 only support borrows with 'static
         let exchanger = self.clone();
         let query_clone = query.clone();
         let varz = scope.context.varz.clone();
+        let with_udp_fallback = self.with_udp_fallback;
+        let fallback_query_clone = query.clone();
+
+        // Try each of the addresses in order
         let try_selection = stream::iter_ok::<_, IoError>(selection.to_vec())
             .and_then(move |addr| {
                 varz.upstream_sent.inc();
+                trace!("trying to connect to {:?}", addr,);
                 // Attempt to do a message exchange
                 let duration = Instant::now();
                 exchange_with_tcp(&addr, query_clone.clone())
-                .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / num_choices as u64))
-                .then(move |res| match res {
-                    Ok((message, stream)) => Ok(Some((message, stream, addr, duration.elapsed()))),
-                    Err(e) => {
-                        info!("error while talking to {}: {}", addr, e);
-                        Ok(None)
-                    }
-                })
+                    .timeout(exchange_timeout)
+                    .then(move |res| match res {
+                        Ok((message, stream)) => {
+                            Ok(Some((message, stream, addr, duration.elapsed())))
+                        }
+                        Err(e) => {
+                            info!("error while talking to {}: {}", addr, e);
+                            Ok(None)
+                        }
+                    })
             })
             // Continue iterating if the query didn't resolve to answer
             .skip_while(move |res| future::ok(res.is_none()))
             // Terminate stream after first successful answer
             .take(1)
             // Finish the in-flight query
-            .fold(0, move |acc, res| {
+            .fold(Vec::new(), move |mut acc, res| {
                 if let Some((message, mut stream, peer_addr, elapsed)) = res {
                     // Save connection if connection reuse is enabled
                     if exchanger.connection_reuse {
@@ -360,17 +429,29 @@ impl Exchanger for TcpExchanger {
                     } else if let Err(e) = stream.close() {
                         warn!("error when closing connection {:?}", e);
                     }
-
-                    exchanger.timetable.pending.finish(&message, &peer_addr);
+                    // Add response to result set
+                    acc.push((message, peer_addr));
                 }
-                Ok::<_, IoError>(acc + 1)
+
+                Ok::<_, IoError>(acc)
             })
             // Return an error if no upstream is available
-            .and_then(move |num_results| {
-                if num_results > 0 {
-                    Ok(())
+            .and_then(move |mut results| match results.pop() {
+                Some(res) => Ok(res),
+                None => Err(ErrorKind::NotFound.into()),
+            })
+            .or_else(move |e| {
+                // If this is the last upstream, and UDP fallback is supported, try that
+                if with_udp_fallback && first_address.is_some() {
+                    let addr = first_address.unwrap();
+                    debug!("all tries failed, fallback to UDP with {:?}", addr);
+                    Either::A(
+                        exchange_with_udp(addr, fallback_query_clone.clone())
+                            .timeout(exchange_timeout)
+                            .map_err(move |_| ErrorKind::TimedOut.into()),
+                    )
                 } else {
-                    Err(ErrorKind::NotFound.into())
+                    Either::B(future::err(e))
                 }
             });
 
@@ -378,26 +459,28 @@ impl Exchanger for TcpExchanger {
         // If there's no open connection, or it doesn't produce a response
         // within a reasonable time, then continue.
         match self.timetable.find_open_connection(selection) {
-            Some(sink) => {
+            Some(conn) => {
                 // Update metrics for reused connection attempt
                 let varz = scope.context.varz.clone();
                 varz.upstream_sent.inc();
                 // Try to do message exchange
                 let started = Instant::now();
                 let timetable = self.timetable.clone();
-                let fast_fallback = self.connection_reuse_fallback;
                 Box::new(
-                    exchange_with_open_connection(sink, query.clone(), fast_fallback)
-                        .and_then(move |(message, peer_addr)| {
-                            timetable.update_open_connection(&peer_addr, started.elapsed());
-                            timetable.pending.finish(&message, &peer_addr);
-                            varz.upstream_reused.inc();
-                            Ok(())
-                        })
-                        .or_else(move |e| {
-                            debug!("tcp error when reusing connection: {:?}", e);
-                            try_selection
-                        }),
+                    exchange_with_open_connection(
+                        conn,
+                        query.clone(),
+                        self.connection_reuse_fallback,
+                    )
+                    .and_then(move |(message, peer_addr)| {
+                        timetable.update_open_connection(&peer_addr, started.elapsed());
+                        varz.upstream_reused.inc();
+                        Ok((message, peer_addr))
+                    })
+                    .or_else(move |e| {
+                        debug!("tcp error when reusing connection: {:?}", e);
+                        try_selection
+                    }),
                 )
             }
             None => Box::new(try_selection),
@@ -406,15 +489,13 @@ impl Exchanger for TcpExchanger {
 }
 
 /// Exchanger that supports UDP for message exchanges.
-struct UdpExchanger {
-    timetable: Timetable,
-}
+struct UdpExchanger {}
 
 impl Exchanger for UdpExchanger {
     fn exchange(&self, scope: Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
-        let pending = self.timetable.pending.clone();
         let selection = origin.get_scoped(&scope);
-        let num_choices = selection.len();
+        let exchange_timeout =
+            Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / (selection.len() + 1) as u64);
         let varz = scope.context.varz.clone();
         let query_clone = query.clone();
         Box::new(
@@ -425,62 +506,56 @@ impl Exchanger for UdpExchanger {
                     varz.upstream_sent.inc();
                     // TODO: implement the variant with reusing a pool of bound sockets
                     exchange_with_udp(addr, query.clone())
-                    .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS / num_choices as u64))
-                    .then(move |res| match res {
-                        Ok((message, peer_addr)) => Ok(Some((message, peer_addr))),
-                        Err(e) => {
-                            info!("error while talking to {}: {}", addr, e);
-                            Ok(None)
-                        }
-                    })
+                        .timeout(exchange_timeout)
+                        .then(move |res| match res {
+                            Ok((message, peer_addr)) => Ok(Some((message, peer_addr))),
+                            Err(e) => {
+                                info!("error while talking to {}: {}", addr, e);
+                                Ok(None)
+                            }
+                        })
                 })
                 // Continue iterating if the query didn't resolve to answer
                 .skip_while(move |res| future::ok(res.is_none()))
                 // Terminate stream after first successful answer
                 .take(1)
                 // Finish the in-flight query
-                .fold(0, move |acc, res| {
+                .fold(Vec::new(), move |mut acc, res| {
                     if let Some((message, peer_addr)) = res {
                         // Retry with TCP on truncation, otherwise finish
                         if message.header().tc() {
-                            let pending = pending.clone();
                             return Either::A(
                                 exchange_with_tcp(&peer_addr, query_clone.clone()).and_then(
                                     move |(message, _stream)| {
-                                        pending.finish(&message, &peer_addr);
-                                        future::ok(acc + 1)
+                                        let mut acc = Vec::new();
+                                        acc.push((message, peer_addr));
+                                        future::ok(acc)
                                     },
                                 ),
                             );
                         } else {
-                            pending.finish(&message, &peer_addr);
+                            acc.push((message, peer_addr));
                         }
                     }
-                    Either::B(future::ok::<_, IoError>(acc + 1))
+                    Either::B(future::ok::<_, IoError>(acc))
                 })
                 // Return an error if no upstream is available
-                .and_then(move |num_results| {
-                    if num_results > 0 {
-                        Ok(())
-                    } else {
-                        Err(ErrorKind::NotFound.into())
-                    }
+                .and_then(move |mut results| match results.pop() {
+                    Some(res) => Ok(res),
+                    None => Err(ErrorKind::NotFound.into()),
                 }),
         )
     }
 }
 
 /// Dummy exchanger that mirrors the query back
-struct NoopExchanger {
-    timetable: Timetable,
-}
+struct NoopExchanger {}
 
 impl Exchanger for NoopExchanger {
     fn exchange(&self, scope: Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
         let selection = origin.get_scoped(&scope);
         if let Some(addr) = selection.first() {
-            self.timetable.pending.finish(&query, addr);
-            Box::new(future::ok(()))
+            Box::new(future::ok((query, *addr)))
         } else {
             Box::new(future::err(ErrorKind::NotFound.into()))
         }
@@ -509,7 +584,7 @@ impl Default for Builder {
             connection_concurrency: DEFAULT_CONNECTION_CONCURRENCY,
             max_active_queries: 0,
             max_clients_waiting_for_query: 0,
-            max_keepalive_connections: DEFAULT_CONNECTION_CONCURRENCY,
+            max_keepalive_connections: DEFAULT_CONNECTION_CONCURRENCY / 2,
         }
     }
 }
@@ -547,7 +622,7 @@ impl Builder {
         self
     }
 
-    /// Set maximum number of upstream connections (default is 1000).
+    /// Set maximum number of upstream connections (default is 500).
     /// When set to 0, it disables connection reuse as no upstream connection could be kept open.
     pub fn with_max_keepalive_connections(mut self, value: usize) -> Self {
         self.max_keepalive_connections = value;
@@ -570,7 +645,9 @@ impl Builder {
     pub fn build(self) -> Conductor {
         let timetable = Timetable {
             pending: Arc::new(PendingQueries::new(self.max_clients_waiting_for_query)),
-            connections: Arc::new(EstablishedConnections::new(ClockProCache::new(self.max_keepalive_connections).expect("connection cache"))),
+            connections: Arc::new(EstablishedConnections::new(
+                ClockProCache::new(self.max_keepalive_connections).expect("connection cache"),
+            )),
         };
 
         let exchanger: Arc<Exchanger> = if self.enable_tcp {
@@ -579,15 +656,12 @@ impl Builder {
                 connection_reuse: self.connection_reuse,
                 connection_reuse_fallback: self.connection_reuse_fallback,
                 connection_concurrency: self.connection_concurrency,
+                with_udp_fallback: self.enable_udp,
             })
         } else if self.enable_udp {
-            Arc::new(UdpExchanger {
-                timetable: timetable.clone(),
-            })
+            Arc::new(UdpExchanger {})
         } else {
-            Arc::new(NoopExchanger {
-                timetable: timetable.clone(),
-            })
+            Arc::new(NoopExchanger {})
         };
 
         Conductor {
@@ -606,6 +680,52 @@ impl From<&Arc<Config>> for Conductor {
             .with_max_keepalive_connections(config.max_upstream_connections)
             .with_connection_reuse_fallback(config.server_type == ServerType::Recursive)
             .build()
+    }
+}
+
+/// FIFO queue of waiting queries roughly sorted by the time of insertion.
+#[derive(Default, Clone)]
+struct PendingQueue {
+    inner: Arc<RwLock<VecDeque<(CacheKey, ResponseSender)>>>,
+}
+
+impl PendingQueue {
+    /// Returns the queue length.
+    fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Pushes a new query into the queue.
+    fn push(&self, key: CacheKey, sink: ResponseSender) {
+        let mut pending = self.inner.write();
+        pending.push_back((key, sink));
+    }
+
+    /// Removes a query from the queue and returns its sender.
+    fn remove(&self, key: &CacheKey) -> Option<(CacheKey, ResponseSender)> {
+        let mut pending = self.inner.write();
+        // The queries are in a FIFO, so assume the responses are coming in order
+        // as well, starting from the oldest one.
+        let mut i = 0;
+        let mut end = pending.len();
+        while i < end {
+            let entry = &pending[i];
+            // This is the query we're looking for
+            if &entry.0 == key {
+                return pending.swap_remove_front(i);
+            }
+            // This is a query older than we're looking for, and canceled, sweep it
+            if entry.1.is_canceled() {
+                // Swap with an entry from the front of the queue.
+                // We've already inspected this entry, so we don't have to move iterator.
+                pending.swap_remove_front(i);
+                end -= 1;
+            }
+            // Inspect next entry
+            i += 1;
+        }
+
+        None
     }
 }
 
@@ -631,18 +751,24 @@ fn keep_open_connection(
         .send_all(stream::repeat::<(), mpsc::SendError<_>>(()).take(concurrency as u64))
         .then(move |_| Ok(()));
 
-    // Spawn background message writer
-    let pending = Arc::new(PendingQueries::default());
+    // Process inbound queries and send them into the open connection.
+    // Each sent message registers a slot in the queue, so it can be matched with response later.
+    let pending = PendingQueue::default();
     let (sink, stream) = stream.split();
     let sender_future = {
         let pending = pending.clone();
         receiver
             .zip(token_reader)
-            .map(move |((msg, sink), _)| {
+            .filter_map(move |((msg, sink), _)| {
                 let key = CacheKey::from(&msg);
                 debug!("reused connection, forwarding message '{}'", key);
-                pending.start(&key, sink);
-                msg.as_bytes().clone()
+                // Make sure there's no more  earliest waiting query from the queue
+                if pending.len() < concurrency {
+                    pending.push(key, sink);
+                    Some(msg.as_bytes().clone())
+                } else {
+                    None
+                }
             })
             .map_err(move |_| ErrorKind::BrokenPipe.into())
             .fold(sink, move |sink, msg| sink.send(msg))
@@ -657,12 +783,12 @@ fn keep_open_connection(
             .for_each(move |resp| {
                 // Parse response and attempt to close pending queries
                 let tokens = if let Ok(msg) = Message::from_bytes(resp.into()) {
-                    debug!(
-                        "reused connection, received response '{}'",
-                        CacheKey::from(&msg)
-                    );
-
-                    pending.finish(&msg, &peer_addr)
+                    let key = CacheKey::from(&msg);
+                    debug!("reused connection, received response '{}'", key);
+                    if let Some((_, sink)) = pending.remove(&key) {
+                        drop(sink.send((msg, peer_addr)));
+                    }
+                    1
                 } else {
                     debug!("reused connection, received invalid response");
                     0
@@ -765,11 +891,9 @@ fn exchange_with_tcp(
             stream
                 .send(query.as_slice().into())
                 .and_then(move |stream| {
-                    stream
-                        .into_future()
-                        .map_err(move |_e| {
-                            IoError::new(ErrorKind::UnexpectedEof, "no response within timeout")
-                        })
+                    stream.into_future().map_err(move |_e| {
+                        IoError::new(ErrorKind::UnexpectedEof, "no response within timeout")
+                    })
                 })
         })
         .and_then(move |(response, stream)| match response {
@@ -784,15 +908,17 @@ fn exchange_with_tcp(
         })
 }
 
+/// Get an address for socket binding based on the family
+fn get_local_addr(ipv6: bool) -> SocketAddr {
+    SocketAddr::new(if ipv6 { *UNBOUND_IPV6 } else { *UNBOUND_IPV4 }, 0)
+}
+
 /// Returns a future that tries to perform a message exchange over UDP.
 fn exchange_with_udp(
     addr: SocketAddr,
     query: Message,
 ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
-    let local_addr = match addr.is_ipv6() {
-        true => "[::]:0".parse().unwrap(),
-        false => "0.0.0.0:0".parse().unwrap(),
-    };
+    let local_addr = get_local_addr(addr.is_ipv6());
     let socket = UdpSocket::bind(&local_addr).expect("bound socket");
     udp_framed_transport(socket)
         .send((query.as_bytes().clone(), addr))

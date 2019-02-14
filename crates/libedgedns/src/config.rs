@@ -106,7 +106,7 @@ impl Default for Config {
              max_waiting_clients: 1_000_000,
              max_active_queries: 100_000,
              max_clients_waiting_for_query: 1_000,
-             max_upstream_connections: 1_000,
+             max_upstream_connections: 500,
              hooks_basedir: None,
              hooks_socket_path: None,
         }
@@ -300,7 +300,7 @@ impl Config {
 
         let max_upstream_connections = config_global
             .and_then(|x| x.get("max_upstream_connections"))
-            .map_or(1_000, |x| {
+            .map_or(500, |x| {
                 x.as_integer()
                     .expect("global.max_upstream_connections must be an integer")
             }) as usize;

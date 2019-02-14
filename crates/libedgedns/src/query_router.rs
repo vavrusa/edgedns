@@ -18,6 +18,10 @@ use std::sync::Arc;
 use stream_cancel::Tripwire;
 use tokio::await;
 
+lazy_static! {
+    static ref DNAME_SERVER: Dname = Dname::from_str("server.").unwrap();
+}
+
 #[derive(Clone)]
 pub struct Scope {
     pub query: Message,
@@ -133,20 +137,12 @@ impl QueryRouter {
                 // Handle errors during processing
                 match res {
                     Ok(message) => {
-                        let is_valid = {
-                            let hdr = message.header();
-                            !hdr.tc() && hdr.qr()
-                        };
-
-                        if is_valid {
-                            trace!("storing message in cache: {}B", message.len());
-                            cache.insert(cache_key, message.clone().into());
-                        }
-
+                        trace!("query router resolved '{}': {}", cache_key, message.header().rcode());
+                        cache.insert(cache_key, message.clone().into());
                         resolve_from_answer(&scope, message, answer, None)
                     }
                     Err(e) => {
-                        info!("query router failed to resolve '{}': {:?}", cache_key, e);
+                        debug!("query router failed to resolve '{}': {:?}", cache_key, e);
                         self.context.varz.client_queries_errors.inc();
                         resolve_to_error(&scope, answer, Rcode::ServFail, false)
                     }
@@ -159,10 +155,6 @@ impl QueryRouter {
 
         answer
     }
-}
-
-lazy_static! {
-    static ref DNAME_SERVER: Dname = Dname::from_str("server.").unwrap();
 }
 
 fn resolve_from_answer(

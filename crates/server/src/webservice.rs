@@ -61,7 +61,7 @@ impl WebService {
                     // Serve pending conductor queries
                     (&Method::GET, "/conductor") => {
                         let mut buffer = String::new();
-                        context.conductor.clone().process_list(&mut buffer);
+                        context.conductor.clone().pending_queries(&mut buffer);
                         *response.body_mut() = Body::from(buffer);
                     }
 

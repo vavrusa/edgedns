@@ -3,7 +3,7 @@ use crate::conductor::Origin;
 use crate::config::Config;
 use crate::context::Context;
 use crate::query_router::Scope;
-use crate::HEALTH_CHECK_MS;
+use crate::{HEALTH_CHECK_MS, UPSTREAM_TOTAL_TIMEOUT_MS};
 use bytes::Bytes;
 use domain_core::bits::*;
 use domain_core::iana::*;
@@ -134,7 +134,11 @@ impl Recursor {
                         }
                         None => {
                             let origin = Arc::new(PreferenceList { addresses });
-                            let response = await!(conductor.resolve(scope.clone(), msg, origin));
+                            let response = await!(
+                                conductor
+                                    .resolve(scope.clone(), msg, origin)
+                                    .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
+                            );
 
                             // Update infrastructure cache
                             if let Some(ref mut cache) = cache {
@@ -174,7 +178,7 @@ impl Recursor {
                     match response {
                         Ok((msg, from)) => request.consume(msg.as_slice(), from),
                         Err(e) => {
-                            info!("error when resolving query '{:?}' with origin '{}' : {:?}", cache_key, first_address, e);
+                            info!("error when resolving query '{}' with origin '{}' : {:?}", cache_key, first_address, e);
                             request.consume(&[], first_address)
                         }
                     }
@@ -184,7 +188,7 @@ impl Recursor {
 
             // Limit the maximum number of iterations
             if iterations >= MAX_ITERATIONS_PER_QUERY {
-                info!("maximum number of iterations for query: {:?}'", CacheKey::from(&scope));
+                info!("maximum number of iterations for query: '{}'", CacheKey::from(&scope));
                 state = kres::State::FAIL;
                 break;
             }

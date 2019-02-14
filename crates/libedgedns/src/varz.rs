@@ -25,6 +25,7 @@ pub struct Inner {
     pub client_queries_offline: Counter,
     pub client_queries_errors: Counter,
     pub inflight_queries: Gauge,
+    pub upstream_inflight_queries: Gauge,
     pub upstream_errors: Counter,
     pub upstream_sent: Counter,
     pub upstream_received: Counter,
@@ -129,6 +130,12 @@ impl Inner {
             inflight_queries: register_gauge!(opts!(
                 "edgedns_inflight_queries",
                 "Number of queries currently waiting for a response",
+                labels! {"handler" => "all",}
+            ))
+            .unwrap(),
+            upstream_inflight_queries: register_gauge!(opts!(
+                "edgedns_upstream_inflight_queries",
+                "Number of queries to upstream currently waiting for a response",
                 labels! {"handler" => "all",}
             ))
             .unwrap(),

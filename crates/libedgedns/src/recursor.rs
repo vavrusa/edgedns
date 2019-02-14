@@ -20,6 +20,9 @@ use tokio::await;
 use tokio::prelude::*;
 use tokio::timer::Interval;
 
+/// Maximum number of iterations spent for each query
+const MAX_ITERATIONS_PER_QUERY : usize = 100;
+
 #[derive(Clone)]
 pub struct Recursor {
     resolver: Arc<kres::Context>,
@@ -104,6 +107,7 @@ impl Recursor {
         let mut state = request.consume(scope.query.as_bytes(), scope.peer_addr);
 
         // Generate an outbound query
+        let mut iterations = 0;
         let conductor = scope.context.conductor.clone();
         while state == kres::State::PRODUCE {
             state = match request.produce() {
@@ -157,7 +161,7 @@ impl Recursor {
 
                                     // TODO: avoid inserting final response
                                     if is_valid && is_infrastructure {
-                                        cache.insert(cache_key, msg.clone().into());
+                                        cache.insert(cache_key.clone(), msg.clone().into());
                                     }
                                 }
                             }
@@ -170,13 +174,22 @@ impl Recursor {
                     match response {
                         Ok((msg, from)) => request.consume(msg.as_slice(), from),
                         Err(e) => {
-                            info!("error when resolving query with origin: {:?}", e);
+                            info!("error when resolving query '{:?}' with origin '{}' : {:?}", cache_key, first_address, e);
                             request.consume(&[], first_address)
                         }
                     }
                 }
                 None => kres::State::DONE,
             };
+
+            // Limit the maximum number of iterations
+            if iterations >= MAX_ITERATIONS_PER_QUERY {
+                info!("maximum number of iterations for query: {:?}'", CacheKey::from(&scope));
+                state = kres::State::FAIL;
+                break;
+            }
+
+            iterations += 1;
         }
 
         // Get final answer

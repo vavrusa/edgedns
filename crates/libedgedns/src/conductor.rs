@@ -92,6 +92,7 @@ impl Conductor {
         let queue_len = self.timetable.pending.start(&key, tx);
         if queue_len == 1 {
             debug!("registered query '{}'", key);
+            varz.upstream_inflight_queries.inc();
             let start_timer = varz.upstream_rtt.start_timer();
             Either::A(
                 self.exchanger
@@ -100,6 +101,7 @@ impl Conductor {
                     // Clear the pending query on exchange errors
                     .then(move |res| {
                         drop(start_timer);
+                        varz.upstream_inflight_queries.dec();
                         match res {
                             Ok((msg, from)) => {
                                 varz.upstream_response_sizes.observe(msg.len() as f64);

@@ -22,7 +22,32 @@ lazy_static! {
     static ref DNAME_SERVER: Dname = Dname::from_str("server.").unwrap();
 }
 
-#[derive(Clone)]
+/// A request scope is a handle and state for a single client request.
+/// It keeps the client query and source information, as well as a reference
+/// to the context on which it was created.
+///
+/// ```rust
+/// #![feature(await_macro, async_await, futures_api)]
+/// use tokio::await;
+/// use domain_core::bits::{Dname, Question, SectionBuilder, MessageBuilder};
+/// use domain_core::iana::{Rtype, Class};
+/// use bytes::{Bytes, BytesMut};
+/// use libedgedns::{Config, Context, QueryRouter, Scope};
+///
+/// let context = Context::new(Config::default());
+/// let router = QueryRouter::new(context.clone());
+/// let query = {
+///    let mut mb = MessageBuilder::with_capacity(512);
+///    mb.push(Question::new(Dname::root(), Rtype::Ns, Class::In)).unwrap();
+///    mb.finish().into()
+/// };
+///
+/// let scope = Scope::new(context.clone(), query, "127.0.0.1:53".parse().unwrap()).expect("scope");
+/// tokio::run_async(async move {
+///     println!("result: {:?}", await!(router.resolve(scope, BytesMut::new())));
+/// });
+///
+/// ```
 pub struct Scope {
     pub query: Message,
     pub question: Question<ParsedDname>,
@@ -31,17 +56,33 @@ pub struct Scope {
     protocol: Protocol,
 }
 
+impl Clone for Scope {
+    fn clone(&self) -> Self {
+        Self {
+            query: self.query.clone(),
+            question: self.question.clone(),
+            peer_addr: self.peer_addr.clone(),
+            context: self.context.clone(),
+            protocol: self.protocol.clone(),
+        }
+    }
+}
+
 impl Scope {
+    /// Creates a new request scope with starting query.
     pub fn new(context: Arc<Context>, query: Bytes, peer_addr: SocketAddr) -> Result<Self> {
         let query = Message::from_bytes(query).unwrap();
         match query.first_question() {
-            Some(question) => Ok(Self {
-                query,
-                question,
-                peer_addr,
-                context,
-                protocol: Protocol::default(),
-            }),
+            Some(question) => {
+                context.varz.inflight_queries.inc();
+                Ok(Self {
+                    query,
+                    question,
+                    peer_addr,
+                    context,
+                    protocol: Protocol::default(),
+                })
+            },
             None => Err(ErrorKind::UnexpectedEof.into()),
         }
     }
@@ -54,6 +95,12 @@ impl Scope {
     /// Get OPT record from client query
     pub fn opt(&self) -> Option<opt::OptRecord> {
         self.query.opt()
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        self.context.varz.inflight_queries.dec();
     }
 }
 
@@ -111,7 +158,6 @@ impl QueryRouter {
         };
 
         // Process query
-        self.context.varz.inflight_queries.inc();
         match scope.protocol {
             Protocol::Udp => self.context.varz.client_queries_udp.inc(),
             Protocol::Tcp => self.context.varz.client_queries_tcp.inc(),
@@ -149,9 +195,6 @@ impl QueryRouter {
                 }
             }
         };
-
-        // Update metrics
-        self.context.varz.inflight_queries.dec();
 
         answer
     }

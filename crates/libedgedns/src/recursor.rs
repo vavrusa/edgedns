@@ -1,9 +1,9 @@
 use crate::cache::{Cache, CacheKey};
-use crate::conductor::Origin;
+use crate::conductor::{Origin, Timetable, DEFAULT_EXCHANGE_TIMEOUT};
 use crate::config::Config;
 use crate::context::Context;
 use crate::query_router::Scope;
-use crate::{HEALTH_CHECK_MS, UPSTREAM_TOTAL_TIMEOUT_MS};
+use crate::{HEALTH_CHECK_MS};
 use bytes::Bytes;
 use domain_core::bits::*;
 use domain_core::iana::*;
@@ -101,7 +101,6 @@ impl Recursor {
     pub async fn resolve<'a>(&'a self, scope: &'a Scope) -> Result<Message> {
         let request = kres::Request::new(self.resolver.clone());
         let mut cache = self.cache.clone();
-        let scope = scope.clone();
 
         // Push it as a question to request
         let mut state = request.consume(scope.query.as_bytes(), scope.peer_addr);
@@ -129,6 +128,7 @@ impl Recursor {
                     let response = match cached_response {
                         Some(msg) => {
                             // Cache response has no source address specified
+                            trace!("recursor has response from cache for '{}'", cache_key);
                             let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
                             Ok((msg, from))
                         }
@@ -136,8 +136,8 @@ impl Recursor {
                             let origin = Arc::new(PreferenceList { addresses });
                             let response = await!(
                                 conductor
-                                    .resolve(scope.clone(), msg, origin)
-                                    .timeout(Duration::from_millis(UPSTREAM_TOTAL_TIMEOUT_MS))
+                                    .resolve(scope, msg, origin)
+                                    .timeout(DEFAULT_EXCHANGE_TIMEOUT)
                             );
 
                             // Update infrastructure cache
@@ -188,7 +188,7 @@ impl Recursor {
 
             // Limit the maximum number of iterations
             if iterations >= MAX_ITERATIONS_PER_QUERY {
-                info!("maximum number of iterations for query: '{}'", CacheKey::from(&scope));
+                info!("maximum number of iterations for query: '{}'", CacheKey::from(scope));
                 state = kres::State::FAIL;
                 break;
             }
@@ -213,6 +213,22 @@ struct PreferenceList {
 impl Origin for PreferenceList {
     fn get(&self) -> &[SocketAddr] {
         &self.addresses
+    }
+
+    fn get_scoped(&self, _scope: &Scope, timetable: &Timetable) -> Vec<SocketAddr> {
+        let mut list = self.get().to_vec();
+
+        // TODO: sort by metrics from conductor instead of relying on the library
+
+        // Try to reuse open connections by putting them in front
+        for i in 0..list.len() {
+            if timetable.contains_open_connection(&list[i]) {
+                list.swap(0, i);
+                break;
+            }
+        }
+
+        list
     }
 }
 
@@ -262,7 +278,6 @@ mod test {
     use std::net::SocketAddr;
     use test::{black_box, Bencher};
     use tokio::await;
-    use tokio::runtime::current_thread::Runtime;
 
     #[bench]
     fn resolve_1k_async(b: &mut Bencher) {

@@ -8,9 +8,8 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use clap::{App, Arg};
 use coarsetime::Instant;
 use env_logger;
-use libedgedns::{Cache, Conductor, Config, Context, Server, Varz};
+use libedgedns::{Config, Context, Server};
 use log::*;
-use std::sync::Arc;
 use std::time::Duration;
 use stream_cancel::{StreamExt, Tripwire};
 use tokio::prelude::*;
@@ -56,16 +55,12 @@ fn main() {
             );
             return;
         }
-        Ok(config) => Arc::new(config),
+        Ok(config) => config,
     };
-
-    let varz = Varz::default();
 
     tokio::run_async(
         async move {
-            let conductor = Arc::new(Conductor::from(&config));
-            let cache = Cache::from(&config);
-            let context = Context::new(config.clone(), conductor, cache, varz.clone());
+            let context = Context::new(config);
 
             // Graceful shutdown trigger
             let (trigger, tripwire) = Tripwire::new();
@@ -91,7 +86,7 @@ fn main() {
             );
 
             // Start server
-            let server = Server::new(context.clone(), config.max_active_queries);
+            let server = Server::new(context.clone(), context.config.max_active_queries);
             if let Err(e) = server.spawn(tripwire.clone()) {
                 error!("error whilst starting server: {:?}", e)
             }

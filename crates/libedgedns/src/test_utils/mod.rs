@@ -1,11 +1,9 @@
 // Utilities for a test module
 #![allow(dead_code)]
-use crate::cache::Cache;
 use crate::codecs::*;
-use crate::conductor::{Conductor, Origin};
+use crate::conductor::Origin;
 use crate::config::{Config, ServerType};
 use crate::context::Context;
-use crate::varz::Varz;
 use bytes::Bytes;
 use domain_core::bits::*;
 use futures::Future;
@@ -23,7 +21,6 @@ const DOMAINS_STR: &str = include_str!("domains.csv");
 
 // Static variables
 lazy_static! {
-    pub static ref VARZ: Varz = Varz::default();
     pub static ref MSG: Message = Message::from_bytes(Bytes::from_static(&[0u8; 12])).unwrap();
     pub static ref DOMAINS: Vec<Dname> = DOMAINS_STR
         .lines()
@@ -40,12 +37,7 @@ pub fn test_context() -> Arc<Context> {
     let mut config = Config::default();
     config.cache_size = 10;
     config.server_type = ServerType::Recursive;
-    config.upstream_max_failure_duration = Duration::from_millis(2500);
-
-    let config = Arc::new(config);
-    let conductor = Arc::new(Conductor::from(&config));
-    let cache = Cache::from(&config);
-    Context::new(config, conductor, cache, VARZ.clone())
+    Context::new(config)
 }
 
 /// Create an echo server (UDP and TCP) and return the listener address, and the server future

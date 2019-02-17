@@ -1,7 +1,7 @@
 use crate::cache::Cache;
 use crate::conductor::Conductor;
 use crate::config::Config;
-use crate::varz::Varz;
+use crate::varz::{self, Varz};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -13,17 +13,13 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(
-        config: Arc<Config>,
-        conductor: Arc<Conductor>,
-        cache: Cache,
-        varz: Varz,
-    ) -> Arc<Context> {
+    pub fn new(config: Config) -> Arc<Context> {
+        let config = Arc::new(config);
         Arc::new(Context {
+            cache: Cache::from(&config),
+            conductor: Arc::new(Conductor::from(&config)),
+            varz: varz::current(),
             config,
-            cache,
-            conductor,
-            varz,
         })
     }
 }

@@ -248,8 +248,7 @@ pub struct CacheStats {
 #[cfg(test)]
 mod test {
     use super::{Cache, CacheKey};
-    use crate::config::Config;
-    use crate::test_utils::{DOMAINS, MSG, VARZ};
+    use crate::test_utils::{DOMAINS, MSG};
     use domain_core::iana::{Class, Rtype};
     use rand::distributions::{Distribution, Normal};
     use test::{black_box, Bencher};
@@ -258,12 +257,10 @@ mod test {
     fn insert_normal_1k(b: &mut Bencher) {
         let keys: Vec<_> = DOMAINS
             .iter()
-            .map(|dname| CacheKey::from((dname, Rtype::A, Class::In)))
+            .map(|dname| CacheKey::from((dname, Rtype::A, Class::In, false)))
             .collect();
         let key_count = keys.len();
-        let mut config = Config::default();
-        config.cache_size = key_count / 100;
-        let mut c = Cache::new(&config, VARZ.clone());
+        let mut c = Cache::new(key_count / 100, 0, 3_600);
 
         // This should roughly cover all elements (within 3-sigma)
         let domains_half = (key_count / 2) as f64;
@@ -291,11 +288,9 @@ mod test {
             .map(|dname| CacheKey::from((dname, Rtype::A, Class::In, false)))
             .collect();
         let key_count = keys.len();
-        let mut config = Config::default();
 
         // The cache size is ~ 1x sigma (stddev) to retain roughly >68% of records
-        config.cache_size = key_count / 3;
-        let mut c = Cache::new(&config, VARZ.clone());
+        let mut c = Cache::new(key_count / 3, 0, 3_600);
 
         // This should roughly cover all elements (within 3-sigma)
         let domains_half = (key_count / 2) as f64;

@@ -6,6 +6,17 @@
 use coarsetime::Instant;
 use prometheus::*;
 use std::sync::Arc;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    // Create a singleton instance since metrics can be registered in storage just once.
+    static ref VARZ: Varz = Varz::default();
+}
+
+/// Get current metrics.
+pub fn current() -> Varz {
+    VARZ.clone()
+}
 
 pub struct StartInstant(pub Instant);
 
@@ -38,7 +49,7 @@ pub struct Inner {
 pub type Varz = Arc<Inner>;
 
 impl Inner {
-    pub fn new() -> Inner {
+    fn new() -> Inner {
         Inner {
             start_instant: StartInstant::default(),
             uptime: register_gauge!(opts!(

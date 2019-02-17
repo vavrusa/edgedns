@@ -1,4 +1,4 @@
-use crate::conductor::Origin;
+use crate::conductor::{Origin, Timetable};
 use crate::config::Config;
 use crate::query_router::Scope;
 use crate::context::Context;
@@ -42,7 +42,7 @@ impl Forwarder {
     pub fn resolve(&self, scope: &Scope) -> impl Future<Item = Message, Error = Error> {
         let conductor = scope.context.conductor.clone();
         conductor
-            .resolve(scope.clone(), scope.query.clone(), self.origin.clone())
+            .resolve(scope, scope.query.clone(), self.origin.clone())
             .timeout(self.upstream_total_timeout).map_err(|_| ErrorKind::TimedOut.into())
             .map(move |(message, _from)| message)
     }
@@ -150,11 +150,11 @@ impl Origin for JumpHashOrigin {
         &self.addresses
     }
 
-    fn get_scoped(&self, scope: &Scope) -> &[SocketAddr] {
+    fn get_scoped(&self, scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
         let slot = self
             .jumphasher
             .slot(scope.question.qname(), self.addresses.len() as u32) as usize;
-        &self.addresses[slot..]
+        (&self.addresses[slot..]).to_vec()
     }
 }
 

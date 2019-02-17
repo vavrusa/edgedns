@@ -10,7 +10,7 @@ use clap::{App, Arg};
 use domain_core::bits::*;
 use env_logger;
 use futures::future::Either;
-use libedgedns::{Cache, Conductor, Config, Context, Scope, Varz};
+use libedgedns::{Config, Context, Scope};
 use log::*;
 use parking_lot::{Mutex};
 use std::collections::HashMap;
@@ -200,11 +200,8 @@ fn file_reloader(module_ns: Arc<Mutex<HashMap<String, Instance>>>, wasm_file: St
 }
 
 fn runtime_context() -> Arc<Context> {
-    let config = Arc::new(Config::default());
-    let varz = Varz::default();
-    let conductor = Conductor::new();
-    let cache = Cache::from(&config);
-    Context::new(config.clone(), conductor, cache, varz)
+    let config = Config::default();
+    Context::new(config)
 }
 
 fn read_to_end(path: PathBuf) -> Result<Vec<u8>, io::Error> {

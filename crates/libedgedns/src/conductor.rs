@@ -48,6 +48,11 @@ lazy_static! {
 /// The implementations of the trait define the order and size of the slice
 /// for each request.
 pub trait Origin: Send + Sync {
+    /// Returns an optional origin name.
+    fn name(&self) -> &str {
+        "origin"
+    }
+
     /// Returns a selection of addresses for next request.
     fn get(&self) -> &[SocketAddr];
 
@@ -438,6 +443,7 @@ impl Exchanger for TcpExchanger {
 
         // Clone inner variables because Futures 0.1 only support borrows with 'static
         let timetable = self.timetable.clone();
+        let origin_name = origin.name();
 
         // Each nameserver tries to lookup expected RTT based on past tries,
         // if there's no previous information stored, it will use a fixed delay until the timeout.
@@ -470,6 +476,7 @@ impl Exchanger for TcpExchanger {
             let query_clone = query.clone();
             let timetable = timetable.clone();
             let trace_span = pending.trace_span.clone();
+            let origin_name = origin_name.to_owned();
 
             // Delay the next query by an expected RTT
             let started = Instant::now().add(next_delay);
@@ -494,7 +501,7 @@ impl Exchanger for TcpExchanger {
                     // Trace the individual subrequest
                     let trace_span = match trace_span {
                         Some(ref span) => {
-                            Some(span.new_child().with_name("tcp").with_remote_endpoint(addr))
+                            Some(span.new_child().with_name("tcp").with_remote_endpoint(&origin_name, addr))
                         }
                         None => None,
                     };

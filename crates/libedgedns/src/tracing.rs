@@ -30,17 +30,14 @@ mod zipkin_tracer {
     impl Tracer {
         /// Create a tracer configuration from configuration.
         pub fn from_config(config: &Arc<Config>) -> Self {
-            let local_endpoint = zipkin::Endpoint::builder()
-                .service_name("edgedns")
-                .build();
+            let local_endpoint = zipkin::Endpoint::builder().service_name("edgedns").build();
 
             if !config.tracing_enabled {
                 return Tracer {
-                    reporter: Arc::new(
-                        Reporter{
-                            report: Box::new(report::NopReporter {}),
-                            local_endpoint,
-                        }),
+                    reporter: Arc::new(Reporter {
+                        report: Box::new(report::NopReporter {}),
+                        local_endpoint,
+                    }),
                     worker: Mutex::new(None),
                     sampling_rate: 0.0,
                 };
@@ -51,6 +48,7 @@ mod zipkin_tracer {
                 let (stream, report) = zipkin_reporter_http::Builder::new(url.clone())
                     .concurrency(1)
                     .queue_size(250)
+                    .chunk_size(1)
                     .build();
                 (
                     Box::new(report) as Box<zipkin::Report + Send + Sync>,
@@ -62,7 +60,7 @@ mod zipkin_tracer {
             };
 
             Tracer {
-                reporter: Arc::new(Reporter{
+                reporter: Arc::new(Reporter {
                     report,
                     local_endpoint,
                 }),
@@ -94,9 +92,13 @@ mod zipkin_tracer {
                 return None;
             }
 
-            Some(Span::new(self.reporter.clone(), None)
-                .with_name("client-query")
-                .with_tag("dns.query", &format!("{} {}", question.qname(), question.qtype()))
+            Some(
+                Span::new(self.reporter.clone(), None)
+                    .with_name("client-query")
+                    .with_tag(
+                        "dns.query",
+                        &format!("{} {}", question.qname(), question.qtype()),
+                    ),
             )
         }
     }
@@ -112,21 +114,25 @@ mod zipkin_tracer {
         fn new(reporter: Arc<Reporter>, parent: Option<Span>) -> Self {
             let span_id = Self::next_id();
             let mut span = span::Span::builder();
+
+            // Configure span trace and parent
             let trace_id = match parent {
                 Some(ref parent) => {
                     let parent = parent.inner.lock();
                     let trace_id = parent.trace_id;
                     span.trace_id(trace_id.into())
                         .parent_id(parent.span_id.into())
-                        .id(span_id.into());
+                        .id(span_id.into())
+                        .kind(zipkin::Kind::Client);
                     trace_id
-                },
+                }
                 None => {
                     let trace_id = span_id;
                     span.trace_id(trace_id.into())
-                        .id(span_id.into());
+                        .id(span_id.into())
+                        .kind(zipkin::Kind::Server);
                     trace_id
-                },
+                }
             };
 
             Span {
@@ -167,9 +173,10 @@ mod zipkin_tracer {
         }
 
         /// Set remote endpoint information.
-        pub fn with_remote_endpoint(self, addr: SocketAddr) -> Self {
+        pub fn with_remote_endpoint(self, service_name: &str, addr: SocketAddr) -> Self {
             self.inner.lock().span.remote_endpoint(
                 zipkin::Endpoint::builder()
+                    .service_name(service_name)
                     .ip(addr.ip())
                     .port(addr.port())
                     .build(),
@@ -218,7 +225,8 @@ mod zipkin_tracer {
                 if let Ok(duration) = self.timestamp.elapsed() {
                     self.span.duration(duration);
                 }
-                self.span.local_endpoint(self.reporter.local_endpoint.clone());
+                self.span
+                    .local_endpoint(self.reporter.local_endpoint.clone());
                 self.span.build()
             };
             self.sealed.push(span);
@@ -276,7 +284,7 @@ mod noop_tracer {
         pub fn with_tag(self, _key: &str, _value: &str) -> Self {
             unimplemented!()
         }
-        pub fn with_remote_endpoint(self, _addr: SocketAddr) -> Self {
+        pub fn with_remote_endpoint(self, _service_name: &str, _addr: SocketAddr) -> Self {
             unimplemented!()
         }
         pub fn tag(&self, _key: &str, _value: &str) {

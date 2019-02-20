@@ -21,7 +21,7 @@ use tokio::prelude::*;
 use tokio::timer::Interval;
 
 /// Maximum number of iterations spent for each query
-const MAX_ITERATIONS_PER_QUERY: usize = 100;
+const MAX_ITERATIONS_PER_QUERY: usize = 200;
 
 #[derive(Clone)]
 pub struct Recursor {
@@ -137,7 +137,14 @@ impl Recursor {
                             Ok((msg, from))
                         }
                         None => {
-                            let origin = Arc::new(PreferenceList { addresses });
+                            let zone_cut = request
+                                .current_zone_cut()
+                                .and_then(|c| Dname::from_slice(c).ok())
+                                .map(|c| c.to_string());
+                            let origin = Arc::new(PreferenceList {
+                                zone_cut,
+                                addresses,
+                            });
                             let response = await!(conductor
                                 .resolve(scope, msg, origin)
                                 .timeout(DEFAULT_EXCHANGE_TIMEOUT));
@@ -216,9 +223,18 @@ impl Recursor {
 /// Implementation of origin for a list of addresses sorted by preference
 struct PreferenceList {
     addresses: Vec<SocketAddr>,
+    zone_cut: Option<String>,
 }
 
 impl Origin for PreferenceList {
+    fn name(&self) -> &str {
+        // Use zone cut as the origin name
+        match self.zone_cut {
+            Some(ref s) => &s,
+            None => "",
+        }
+    }
+
     fn get(&self) -> &[SocketAddr] {
         &self.addresses
     }

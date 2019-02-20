@@ -16,6 +16,7 @@ pub mod recursor;
 mod server;
 mod test_utils;
 mod varz;
+mod tracing;
 
 pub use crate::cache::*;
 pub use crate::conductor::Conductor;

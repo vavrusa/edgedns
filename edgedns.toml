@@ -103,3 +103,17 @@ basedir = "."
 
 # UNIX socket to control the server from the CLI
 socket_path = "/tmp/edgedns.sock"
+
+[tracing]
+# Enable tracing requests with Zipkin.
+enabled = false
+
+# Reporter collector configuration (URL).
+# reporter_url = "http://localhost:9411"
+
+# Sampling rate for the reporter (0.0 - 1.0).
+# A sampling rate of 0.01 samples 1% of the requests.
+sampling_rate = 0.01
+
+# Reporter verbosity. By default, the reporter reports only failed requests.
+only_failures = false

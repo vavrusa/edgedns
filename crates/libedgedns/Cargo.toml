@@ -5,6 +5,10 @@ authors = ["Frank Denis <github@pureftpd.org>", "Marek Vavrusa <marek@vavrusa.co
 publish = false
 edition = "2018"
 
+[features]
+tracing = ["zipkin", "zipkin-reporter-http"]
+default = ["tracing"]
+
 [lib]
 name = "libedgedns"
 path = "src/lib.rs"
@@ -30,3 +34,6 @@ clockpro-cache = {git = "https://github.com/vavrusa/rust-clockpro-cache", rev = 
 prometheus = "*"
 hex = "0.3"
 socket2 = {version = "0.3", features = ["reuseport"]}
+zipkin = {git = "https://github.com/vavrusa/rust-zipkin", rev = "ddf69f56ac53815f0f16a7789e1007fe149af631", features = ["serde"], optional = true}
+zipkin-reporter-http = {git = "https://github.com/vavrusa/rust-zipkin", rev = "ddf69f56ac53815f0f16a7789e1007fe149af631", optional = true}
+http = "0.1"

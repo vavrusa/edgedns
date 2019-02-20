@@ -3,7 +3,7 @@ use crate::conductor::{Origin, Timetable, DEFAULT_EXCHANGE_TIMEOUT};
 use crate::config::Config;
 use crate::context::Context;
 use crate::query_router::Scope;
-use crate::{HEALTH_CHECK_MS};
+use crate::HEALTH_CHECK_MS;
 use bytes::Bytes;
 use domain_core::bits::*;
 use domain_core::iana::*;
@@ -21,7 +21,7 @@ use tokio::prelude::*;
 use tokio::timer::Interval;
 
 /// Maximum number of iterations spent for each query
-const MAX_ITERATIONS_PER_QUERY : usize = 100;
+const MAX_ITERATIONS_PER_QUERY: usize = 100;
 
 #[derive(Clone)]
 pub struct Recursor {
@@ -78,9 +78,9 @@ impl Recursor {
 
         // Poll root servers for healthcheck
         while let Some(_) = await!(interval.next()) {
-            let scope = Scope::new(context.clone(), msg.clone(), source).unwrap();
+            let scope = Scope::new(msg.clone(), source).unwrap();
             let start = Instant::now();
-            match await!(self.resolve(&scope)) {
+            match await!(self.resolve(&context, &scope)) {
                 Ok(msg) => {
                     debug!(
                         "polled root servers in {:?}: {}",
@@ -98,7 +98,11 @@ impl Recursor {
         Ok(())
     }
 
-    pub async fn resolve<'a>(&'a self, scope: &'a Scope) -> Result<Message> {
+    pub async fn resolve<'a>(
+        &'a self,
+        context: &'a Arc<Context>,
+        scope: &'a Scope,
+    ) -> Result<Message> {
         let request = kres::Request::new(self.resolver.clone());
         let mut cache = self.cache.clone();
 
@@ -107,7 +111,7 @@ impl Recursor {
 
         // Generate an outbound query
         let mut iterations = 0;
-        let conductor = scope.context.conductor.clone();
+        let conductor = context.conductor.clone();
         while state == kres::State::PRODUCE {
             state = match request.produce() {
                 Some((buf, addresses)) => {
@@ -134,11 +138,9 @@ impl Recursor {
                         }
                         None => {
                             let origin = Arc::new(PreferenceList { addresses });
-                            let response = await!(
-                                conductor
-                                    .resolve(scope, msg, origin)
-                                    .timeout(DEFAULT_EXCHANGE_TIMEOUT)
-                            );
+                            let response = await!(conductor
+                                .resolve(scope, msg, origin)
+                                .timeout(DEFAULT_EXCHANGE_TIMEOUT));
 
                             // Update infrastructure cache
                             if let Some(ref mut cache) = cache {
@@ -178,7 +180,10 @@ impl Recursor {
                     match response {
                         Ok((msg, from)) => request.consume(msg.as_slice(), from),
                         Err(e) => {
-                            info!("error when resolving query '{}' with origin '{}' : {:?}", cache_key, first_address, e);
+                            info!(
+                                "error when resolving query '{}' with origin '{}' : {:?}",
+                                cache_key, first_address, e
+                            );
                             request.consume(&[], first_address)
                         }
                     }
@@ -188,7 +193,10 @@ impl Recursor {
 
             // Limit the maximum number of iterations
             if iterations >= MAX_ITERATIONS_PER_QUERY {
-                info!("maximum number of iterations for query: '{}'", CacheKey::from(scope));
+                info!(
+                    "maximum number of iterations for query: '{}'",
+                    CacheKey::from(scope)
+                );
                 state = kres::State::FAIL;
                 break;
             }
@@ -306,8 +314,8 @@ mod test {
             tokio::run_async(
                 async move {
                     for _ in 1..1000 {
-                        let scope = Scope::new(context.clone(), msg.clone(), peer_addr).unwrap();
-                        black_box(await!(rec.resolve(&scope)).expect("result"));
+                        let scope = Scope::new(msg.clone(), peer_addr).unwrap();
+                        black_box(await!(rec.resolve(&context, &scope)).expect("result"));
                     }
                 },
             );

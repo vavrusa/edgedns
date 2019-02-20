@@ -55,7 +55,6 @@ impl Server {
     }
 
     pub async fn run_udp(
-        context: Arc<Context>,
         router: Arc<QueryRouter>,
         socket: UdpSocket,
         tripwire: Tripwire,
@@ -64,7 +63,6 @@ impl Server {
         let mut stream = stream.take_until(tripwire);
         while let Some(Ok((msg, addr))) = await!(stream.next()) {
             match await!(resolve_message(
-                &context,
                 &router,
                 msg.into(),
                 addr,
@@ -115,13 +113,11 @@ impl Server {
 
         // Receive incoming messages and process asynchronously
         while let Some(Ok((msg, addr))) = await!(stream.next()) {
-            let context = context.clone();
             let router = router.clone();
             let sender = sender.clone();
             tokio::spawn_async(
                 async move {
                     match await!(resolve_message(
-                        &context,
                         &router,
                         msg.into(),
                         addr,
@@ -203,7 +199,6 @@ impl Server {
 
             trace!("tcp client {} processing", peer_addr);
             tokio::spawn_async(process_stream(
-                context.clone(),
                 router.clone(),
                 connections.clone(),
                 peer_addr,
@@ -238,13 +233,13 @@ impl Server {
         let acceptors = self.context.config.udp_acceptor_threads;
         for i in 0..acceptors {
             let socket = clone_udp_socket(&socket)?;
-            let context = self.context.clone();
             let router = self.query_router.clone();
             let tripwire = tripwire.clone();
             if i == acceptors - 1 {
+                let context = self.context.clone();
                 tokio::spawn_async(Self::run_udp_concurrent(context, router, socket, tripwire));
             } else {
-                tokio::spawn_async(Self::run_udp(context, router, socket, tripwire));
+                tokio::spawn_async(Self::run_udp(router, socket, tripwire));
             }
         }
 
@@ -271,7 +266,6 @@ impl Server {
 type EstablishedConnections = Mutex<HashMap<IpAddr, VecDeque<(u16, mpsc::Sender<Bytes>)>>>;
 
 async fn process_stream(
-    context: Arc<Context>,
     router: Arc<QueryRouter>,
     connections: Arc<EstablishedConnections>,
     peer_addr: SocketAddr,
@@ -306,7 +300,6 @@ async fn process_stream(
             Ok(msg) => {
                 // Process message asynchronously
                 tokio::spawn_async(process_message(
-                    context.clone(),
                     router.clone(),
                     sender.clone(),
                     msg.into(),
@@ -342,14 +335,13 @@ async fn process_stream(
 }
 
 async fn process_message(
-    context: Arc<Context>,
     router: Arc<QueryRouter>,
     sender: mpsc::Sender<Bytes>,
     msg: Bytes,
     peer_addr: SocketAddr,
     protocol: Protocol,
 ) {
-    match await!(resolve_message(&context, &router, msg, peer_addr, protocol)) {
+    match await!(resolve_message(&router, msg, peer_addr, protocol)) {
         Ok((response, _)) => match await!(sender.send(response)) {
             Ok(_) => {
                 debug!("sent back response to {}/{:?}", peer_addr, protocol);
@@ -365,7 +357,6 @@ async fn process_message(
 }
 
 pub async fn resolve_message<'a>(
-    context: &'a Arc<Context>,
     router: &'a Arc<QueryRouter>,
     msg: Bytes,
     from: SocketAddr,
@@ -373,9 +364,9 @@ pub async fn resolve_message<'a>(
 ) -> Result<(Bytes, SocketAddr)> {
     let buf = BytesMut::with_capacity(INITIAL_BUF_SIZE);
     // Create a new request scope
-    let result = match Scope::new(context.clone(), msg, from) {
+    let result = match Scope::new(msg, from) {
         Ok(mut scope) => {
-            scope.set_protocol(protocol);
+            scope.with_protocol(protocol);
             await!(router.resolve(scope, buf))
         }
         Err(e) => Err(e),

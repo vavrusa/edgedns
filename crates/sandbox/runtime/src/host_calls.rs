@@ -187,7 +187,7 @@ extern "C" fn forward_create(
 
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let local_scope =
-            Scope::new(instance.context.clone(), msg.into(), local_addr).expect("scope");
+            Scope::new(msg.into(), local_addr).expect("scope");
         (msg.into(), local_scope)
     };
 
@@ -206,7 +206,7 @@ extern "C" fn forward_create(
         forwarder::Builder::new()
             .with_upstream_servers(vec![upstream])
             .build()
-            .resolve(&scope)
+            .resolve(&instance.context, &scope)
             .then(move |res| {
                 match res {
                     // Copy upstream response back to guest memory

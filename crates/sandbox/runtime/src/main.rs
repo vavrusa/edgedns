@@ -111,7 +111,7 @@ fn main() {
         let (sink, stream) = UdpFramed::new(socket, BytesCodec::new()).split();
         let fut = stream
             .and_then(move |(msg, from)| {
-                let scope = Scope::new(context.clone(), msg.clone().into(), from).expect("scope");
+                let scope = Scope::new(msg.clone().into(), from).expect("scope");
                 trace!("processing {} bytes from {}", msg.len(), from);
 
                 // Create a response builder

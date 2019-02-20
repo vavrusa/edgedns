@@ -39,8 +39,8 @@ impl Forwarder {
         Ok(())
     }
 
-    pub fn resolve(&self, scope: &Scope) -> impl Future<Item = Message, Error = Error> {
-        let conductor = scope.context.conductor.clone();
+    pub fn resolve(&self, context: &Arc<Context>, scope: &Scope) -> impl Future<Item = Message, Error = Error> {
+        let conductor = context.conductor.clone();
         conductor
             .resolve(scope, scope.query.clone(), self.origin.clone())
             .timeout(self.upstream_total_timeout).map_err(|_| ErrorKind::TimedOut.into())
@@ -202,9 +202,9 @@ mod test {
                 let context = context.clone();
                 let forwarder = forwarder.clone();
                 let set = (0..1000).map(move |_| {
-                    let scope = Scope::new(context.clone(), msg.clone(), peer_addr).unwrap();
+                    let scope = Scope::new(msg.clone(), peer_addr).unwrap();
                     forwarder
-                        .resolve(&scope)
+                        .resolve(&context, &scope)
                         .and_then(|_| Ok(()))
                         .map_err(|e| eprintln!("resolver err {}", e))
                 });

@@ -2,7 +2,8 @@ use crate::cache::CacheKey;
 use crate::codecs::*;
 use crate::config::Config;
 use crate::query_router::Scope;
-use crate::varz::Varz;
+use crate::tracing;
+use crate::varz;
 use clockpro_cache::*;
 use domain_core::bits::*;
 use futures::future::Either;
@@ -89,14 +90,14 @@ impl Conductor {
         // Retry until a query is either started or enqueued
         loop {
             // First query creates a queue for other same queries
-            if let Some(queue) = self.timetable.start_query(scope, &key) {
+            if let Some(pending) = self.timetable.start_query(scope, &key) {
                 debug!("starting query '{}'", key);
                 return Either::A(
                     self.exchanger
-                        .exchange(scope, query, origin)
+                        .exchange(scope, query, origin, &pending)
                         // Clear the pending query on exchange errors
                         .and_then(move |(msg, from)| {
-                            queue.finish(&msg, &from);
+                            pending.finish(&msg, &from);
                             Ok((msg, from))
                         }),
                 );
@@ -134,7 +135,13 @@ type ExchangeFuture = Box<Future<Item = (Message, SocketAddr), Error = IoError> 
 
 /// Exchanger trait provides an interface for performing message exchanges.
 trait Exchanger: Send + Sync {
-    fn exchange(&self, scope: &Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture;
+    fn exchange(
+        &self,
+        scope: &Scope,
+        query: Message,
+        origin: Arc<Origin>,
+        pending: &PendingQuery,
+    ) -> ExchangeFuture;
 }
 
 /// Structure for conductor bookkeeping, it tracks pending queries and open connections.
@@ -219,20 +226,29 @@ impl Timetable {
 struct PendingQuery {
     context: Arc<PendingQueries>,
     key: Option<CacheKey>,
-    varz: Varz,
     _timer: prometheus::HistogramTimer,
+    trace_span: Option<tracing::Span>,
 }
 
 impl PendingQuery {
     fn new(key: CacheKey, context: Arc<PendingQueries>, scope: &Scope) -> Self {
-        let varz = scope.context.varz.clone();
+        let varz = varz::current();
         varz.upstream_inflight_queries.inc();
         let _timer = varz.upstream_rtt.start_timer();
+        let trace_span = match scope.trace_span {
+            Some(ref span) => Some(
+                span.new_child()
+                    .with_name("upstream-query")
+                    .with_tag("dns.query", &format!("{}", key)),
+            ),
+            None => None,
+        };
+
         Self {
             context,
             key: Some(key),
-            varz,
             _timer,
+            trace_span,
         }
     }
 
@@ -241,8 +257,9 @@ impl PendingQuery {
         if let Some(key) = self.key.take() {
             trace!("finishing pending query '{}'", key);
             self.context.finish(&key, resp, peer_addr);
-            self.varz.upstream_response_sizes.observe(resp.len() as f64);
-            self.varz.upstream_received.inc();
+            let varz = varz::current();
+            varz.upstream_response_sizes.observe(resp.len() as f64);
+            varz.upstream_received.inc();
         }
         drop(self);
     }
@@ -250,10 +267,11 @@ impl PendingQuery {
 
 impl Drop for PendingQuery {
     fn drop(&mut self) {
-        self.varz.upstream_inflight_queries.dec();
+        let varz = varz::current();
+        varz.upstream_inflight_queries.dec();
         if let Some(key) = self.key.take() {
             trace!("closing pending query '{}' without response", key);
-            self.varz.upstream_timeout.inc();
+            varz.upstream_timeout.inc();
             self.context.clear(&key);
         }
     }
@@ -386,7 +404,9 @@ impl ConnectionMetrics {
         let mut inner = self.inner.write();
         match inner.get_mut(address) {
             Some(metrics) => metrics.update(rtt),
-            None => drop(inner.insert(*address, ConnectionTracker::new(rtt))),
+            None => {
+                inner.insert(*address, ConnectionTracker::new(rtt));
+            }
         }
     }
 }
@@ -402,7 +422,13 @@ struct TcpExchanger {
 }
 
 impl Exchanger for TcpExchanger {
-    fn exchange(&self, scope: &Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
+    fn exchange(
+        &self,
+        scope: &Scope,
+        query: Message,
+        origin: Arc<Origin>,
+        pending: &PendingQuery,
+    ) -> ExchangeFuture {
         // Make sure there's at least one address in the origin
         let selection = origin.get_scoped(scope, &self.timetable);
         if selection.is_empty() {
@@ -441,9 +467,9 @@ impl Exchanger for TcpExchanger {
             };
 
             let addr = *addr;
-            let varz = scope.context.varz.clone();
             let query_clone = query.clone();
             let timetable = timetable.clone();
+            let trace_span = pending.trace_span.clone();
 
             // Delay the next query by an expected RTT
             let started = Instant::now().add(next_delay);
@@ -462,13 +488,25 @@ impl Exchanger for TcpExchanger {
             Delay::new(started)
                 .map_err(move |_| ErrorKind::Other.into())
                 .and_then(move |_| {
-                    let varz = varz.clone();
+                    let varz = varz::current();
                     varz.upstream_sent.inc();
+
+                    // Trace the individual subrequest
+                    let trace_span = match trace_span {
+                        Some(ref span) => {
+                            Some(span.new_child().with_name("tcp").with_remote_endpoint(addr))
+                        }
+                        None => None,
+                    };
+
                     // TODO: raise RTT for all previous attempts to least now()
                     // Check if a connection to this upstream is already open
                     let try_connect_or_reuse = match timetable.get_open_connection(&addr) {
                         Some(sender) => {
                             trace!("reusing connection to to {:?}", addr);
+                            if let Some(ref span) = trace_span {
+                                span.annotate("reused");
+                            }
                             Either::A(
                                 exchange_with_open_connection(sender, query_clone.clone())
                                     .and_then(move |(msg, _peer_addr)| {
@@ -486,16 +524,15 @@ impl Exchanger for TcpExchanger {
                         }
                     };
 
-                    // If this is the last upstream, and UDP fallback is supported, try that
-                    if try_udp_fallback {
-                        let try_fallback =
-                            Delay::new(udp_fallback_start_time.add(DEFAULT_EXCHANGE_EXTRA))
-                                .map_err(move |_| ErrorKind::Other.into())
-                                .and_then(move |_| {
-                                    debug!("fallback to UDP with {:?}", addr);
-                                    exchange_with_udp(addr, query_clone.clone())
-                                })
-                                .map(move |(msg, _)| (msg, None));
+                    // Do the message exchange, and try the optional fallback to UDP if it doesn't finish in time
+                    let try_exchange_or_fallback = if try_udp_fallback {
+                        let try_fallback = Delay::new(udp_fallback_start_time)
+                            .map_err(move |_| ErrorKind::Other.into())
+                            .and_then(move |_| {
+                                debug!("fallback to UDP with {:?}", addr);
+                                exchange_with_udp(addr, query_clone.clone())
+                            })
+                            .map(move |(msg, _)| (msg, None));
                         Either::A(
                             future::select_ok(vec![
                                 Either::A(try_connect_or_reuse),
@@ -505,26 +542,40 @@ impl Exchanger for TcpExchanger {
                         )
                     } else {
                         Either::B(try_connect_or_reuse)
-                    }
-                })
-                .then(move |res| match res {
-                    Ok((message, maybe_stream)) => {
-                        let elapsed = started.elapsed();
-                        trace!("response from {} in {:?}", addr, elapsed);
-                        Ok((message, maybe_stream, addr, elapsed))
-                    }
-                    Err(e) => {
-                        debug!("error while talking to {}: {}", addr, e);
-                        Err(e)
-                    }
+                    };
+
+                    // Run the future, and update metrics
+                    try_exchange_or_fallback.then(move |res| match res {
+                        Ok((message, maybe_stream)) => {
+                            // Annotate the subrequest trace span
+                            if let Some(ref span) = trace_span {
+                                span.tag("dns.rcode", &format!("{}", message.header().rcode()));
+                                if maybe_stream.is_none() {
+                                    span.annotate("fallback");
+                                }
+                            }
+
+                            // Update connection metrics
+                            let elapsed = started.elapsed();
+                            timetable.update_rtt(&addr, elapsed);
+                            trace!("response from {} in {:?}", addr, elapsed);
+                            Ok((message, maybe_stream, addr))
+                        }
+                        Err(e) => {
+                            debug!("error while talking to {}: {}", addr, e);
+                            // Annotate the subrequest span
+                            if let Some(ref span) = trace_span {
+                                span.tag("error.message", &e.to_string());
+                            }
+                            Err(e)
+                        }
+                    })
                 })
         });
 
         let exchanger = self.clone();
         Box::new(future::select_ok(retry_plan).and_then(
-            move |((message, maybe_stream, peer_addr, elapsed), _retry_plan)| {
-                // Update connection metrics
-                exchanger.timetable.update_rtt(&peer_addr, elapsed);
+            move |((message, maybe_stream, peer_addr), _retry_plan)| {
                 // Save connection if connection reuse is enabled
                 if let Some(mut stream) = maybe_stream {
                     if exchanger.connection_reuse {
@@ -557,10 +608,16 @@ struct UdpExchanger {
 }
 
 impl Exchanger for UdpExchanger {
-    fn exchange(&self, scope: &Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
+    fn exchange(
+        &self,
+        scope: &Scope,
+        query: Message,
+        origin: Arc<Origin>,
+        _pending: &PendingQuery,
+    ) -> ExchangeFuture {
         let selection = origin.get_scoped(scope, &self.timetable);
         let exchange_timeout = DEFAULT_EXCHANGE_TIMEOUT / selection.len() as u32;
-        let varz = scope.context.varz.clone();
+        let varz = varz::current();
         let query_clone = query.clone();
         Box::new(
             // Iterate through all addresses in selection
@@ -618,7 +675,13 @@ struct NoopExchanger {
 }
 
 impl Exchanger for NoopExchanger {
-    fn exchange(&self, scope: &Scope, query: Message, origin: Arc<Origin>) -> ExchangeFuture {
+    fn exchange(
+        &self,
+        scope: &Scope,
+        query: Message,
+        origin: Arc<Origin>,
+        _pending: &PendingQuery,
+    ) -> ExchangeFuture {
         let selection = origin.get_scoped(scope, &self.timetable);
         if let Some(addr) = selection.first() {
             Box::new(future::ok((query, *addr)))
@@ -712,7 +775,7 @@ impl Builder {
         let exchanger: Arc<Exchanger> = if self.enable_tcp {
             Arc::new(TcpExchanger {
                 timetable: timetable.clone(),
-                connection_reuse: connection_reuse,
+                connection_reuse,
                 connection_concurrency: self.connection_concurrency,
                 with_udp_fallback: self.enable_udp,
             })
@@ -1004,7 +1067,7 @@ fn exchange_with_udp(
 mod test {
     use super::{Builder, Conductor};
     use crate::query_router::Scope;
-    use crate::test_utils::{test_context, test_echo_server, TestOrigin, DOMAINS};
+    use crate::test_utils::{test_echo_server, TestOrigin, DOMAINS};
     use domain_core::bits::*;
     use domain_core::iana::*;
     use std::net::SocketAddr;
@@ -1017,7 +1080,6 @@ mod test {
     const MAX_TEST_DURATION: Duration = Duration::from_millis(60_000);
 
     fn bench_batched(b: &mut Bencher, conductor: Arc<Conductor>) {
-        let context = test_context();
         let (echo_server, addr) = test_echo_server(MAX_TEST_DURATION);
         let peer_addr = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         let origin: Arc<TestOrigin> = Arc::new(addr.into());
@@ -1037,8 +1099,7 @@ mod test {
         // Create a test set
         let test_set = (0..1000).map(move |i| {
             let msg = messages[i % messages.len()].clone();
-            let scope =
-                Scope::new(context.clone(), msg.clone().as_bytes().clone(), peer_addr).unwrap();
+            let scope = Scope::new(msg.clone().as_bytes().clone(), peer_addr).unwrap();
             conductor
                 .resolve(&scope, msg, origin.clone())
                 .then(move |res| {

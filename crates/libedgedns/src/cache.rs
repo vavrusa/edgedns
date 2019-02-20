@@ -114,7 +114,7 @@ impl From<&Scope> for CacheKey {
 impl fmt::Display for CacheKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.qname.fmt(f)?;
-        write!(f, " {:?}", self.qtype)?;
+        write!(f, " {}", self.qtype)?;
         if !self.scope.is_empty() {
             write!(f, "| {:?} ", self.scope)?;
         }

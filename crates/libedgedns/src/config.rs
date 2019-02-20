@@ -4,13 +4,14 @@
 //! server.
 
 use crate::forwarder::LoadBalancingMode;
+use http::Uri;
+use log::*;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
-use log::*;
 use toml;
 
 /// EdgeDNS server type definition.
@@ -75,40 +76,48 @@ pub struct Config {
     pub max_upstream_connections: usize,
     pub hooks_basedir: Option<String>,
     pub hooks_socket_path: Option<String>,
+    pub tracing_enabled: bool,
+    pub tracing_reporter_url: Option<Uri>,
+    pub tracing_sampling_rate: f64,
+    pub tracing_only_failures: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-             server_type: ServerType::default(),
-             decrement_ttl: true,
-             upstream_servers_str: Vec::new(),
-             lbmode: LoadBalancingMode::default(),
-             upstream_max_failure_duration: Duration::from_millis(2500),
-             cache_size: 250_000,
-             udp_ports: 8,
-             listen_addr: "0.0.0.0:53".to_string(),
-             webservice_enabled: false,
-             webservice_listen_addr: "0.0.0.0:9090".to_string(),
-             min_ttl: 1,
-             max_ttl: 86_400,
-             user: None,
-             group: None,
-             chroot_dir: None,
-             udp_acceptor_threads: 1,
-             tcp_acceptor_threads: 1,
-             dnstap_enabled: false,
-             dnstap_backlog: 0,
-             dnstap_socket_path: None,
-             identity: None,
-             version: None,
-             max_tcp_clients: 250,
-             max_waiting_clients: 1_000_000,
-             max_active_queries: 100_000,
-             max_clients_waiting_for_query: 1_000,
-             max_upstream_connections: 500,
-             hooks_basedir: None,
-             hooks_socket_path: None,
+            server_type: ServerType::default(),
+            decrement_ttl: true,
+            upstream_servers_str: Vec::new(),
+            lbmode: LoadBalancingMode::default(),
+            upstream_max_failure_duration: Duration::from_millis(2500),
+            cache_size: 250_000,
+            udp_ports: 8,
+            listen_addr: "0.0.0.0:53".to_string(),
+            webservice_enabled: false,
+            webservice_listen_addr: "0.0.0.0:9090".to_string(),
+            min_ttl: 1,
+            max_ttl: 86_400,
+            user: None,
+            group: None,
+            chroot_dir: None,
+            udp_acceptor_threads: 1,
+            tcp_acceptor_threads: 1,
+            dnstap_enabled: false,
+            dnstap_backlog: 0,
+            dnstap_socket_path: None,
+            identity: None,
+            version: None,
+            max_tcp_clients: 250,
+            max_waiting_clients: 1_000_000,
+            max_active_queries: 100_000,
+            max_clients_waiting_for_query: 1_000,
+            max_upstream_connections: 500,
+            hooks_basedir: None,
+            hooks_socket_path: None,
+            tracing_enabled: false,
+            tracing_reporter_url: None,
+            tracing_sampling_rate: 0.01,
+            tracing_only_failures: false,
         }
     }
 }
@@ -306,7 +315,10 @@ impl Config {
             }) as usize;
 
         if max_clients_waiting_for_query == 0 {
-            warn!("configured with unbounded number of clients waiting for query, default: {}", 1_000);
+            warn!(
+                "configured with unbounded number of clients waiting for query, default: {}",
+                1_000
+            );
         }
 
         let identity = config_global.and_then(|x| x.get("identity")).map(|x| {
@@ -355,6 +367,33 @@ impl Config {
                 .to_owned()
         });
 
+        let config_tracing = toml_config.get("tracing");
+
+        let tracing_enabled = config_tracing
+            .and_then(|x| x.get("enabled"))
+            .map_or(false, |x| {
+                x.as_bool().expect("tracing.enabled must be a boolean")
+            });
+
+        let tracing_reporter_url = config_tracing.and_then(|x| x.get("reporter_url")).map(|x| {
+            let uri = x.as_str().expect("tracing.reporter_url must be a string");
+            Uri::from_str(uri).expect("tracing.reporter_url must be a valid URI")
+        });
+
+        let tracing_sampling_rate = config_tracing
+            .and_then(|x| x.get("sampling_rate"))
+            .map_or(0.01, |x| {
+                x.as_float().expect("tracing.sampling_rate must be a float")
+            }) as f64;
+
+        let tracing_only_failures =
+            config_tracing
+                .and_then(|x| x.get("only_failures"))
+                .map_or(false, |x| {
+                    x.as_bool()
+                        .expect("tracing.only_failures must be a boolean")
+                });
+
         Ok(Config {
             server_type,
             decrement_ttl,
@@ -385,6 +424,10 @@ impl Config {
             max_upstream_connections,
             hooks_basedir,
             hooks_socket_path,
+            tracing_enabled,
+            tracing_reporter_url,
+            tracing_sampling_rate,
+            tracing_only_failures,
         })
     }
 }

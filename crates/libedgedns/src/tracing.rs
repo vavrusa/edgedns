@@ -49,7 +49,8 @@ mod zipkin_tracer {
             let (report, worker) = if let Some(ref url) = config.tracing_reporter_url {
                 debug!("configured tracer with reporter: {}", url);
                 let (stream, report) = zipkin_reporter_http::Builder::new(url.clone())
-                    .chunk_size(1)
+                    .concurrency(1)
+                    .queue_size(250)
                     .build();
                 (
                     Box::new(report) as Box<zipkin::Report + Send + Sync>,
@@ -111,17 +112,22 @@ mod zipkin_tracer {
         fn new(reporter: Arc<Reporter>, parent: Option<Span>) -> Self {
             let span_id = Self::next_id();
             let mut span = span::Span::builder();
-            let mut trace_id = span_id;
-            if let Some(ref parent) = parent {
-                let parent = parent.inner.lock();
-                trace_id = parent.trace_id;
-                span.trace_id(trace_id.into())
-                    .parent_id(parent.span_id.into())
-                    .id(span_id.into());
-            } else {
-                span.trace_id(span_id.into())
-                    .id(span_id.into());
-            }
+            let trace_id = match parent {
+                Some(ref parent) => {
+                    let parent = parent.inner.lock();
+                    let trace_id = parent.trace_id;
+                    span.trace_id(trace_id.into())
+                        .parent_id(parent.span_id.into())
+                        .id(span_id.into());
+                    trace_id
+                },
+                None => {
+                    let trace_id = span_id;
+                    span.trace_id(trace_id.into())
+                        .id(span_id.into());
+                    trace_id
+                },
+            };
 
             Span {
                 inner: Arc::new(Mutex::new(SpanInner {
@@ -221,7 +227,9 @@ mod zipkin_tracer {
             match self.parent {
                 Some(ref parent) => {
                     let mut parent = parent.inner.lock();
-                    parent.sealed.extend_from_slice(&self.sealed);
+                    if !parent.disabled {
+                        parent.sealed.extend_from_slice(&self.sealed);
+                    }
                 }
                 None => {
                     for span in self.sealed.iter() {

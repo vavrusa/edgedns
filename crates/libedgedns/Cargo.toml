@@ -34,6 +34,6 @@ clockpro-cache = {git = "https://github.com/vavrusa/rust-clockpro-cache", rev = 
 prometheus = "*"
 hex = "0.3"
 socket2 = {version = "0.3", features = ["reuseport"]}
-zipkin = {git = "https://github.com/vavrusa/rust-zipkin", rev = "ddf69f56ac53815f0f16a7789e1007fe149af631", features = ["serde"], optional = true}
-zipkin-reporter-http = {git = "https://github.com/vavrusa/rust-zipkin", rev = "ddf69f56ac53815f0f16a7789e1007fe149af631", optional = true}
+zipkin = {git = "https://github.com/vavrusa/rust-zipkin", rev = "c856015ff2bbee50b533198aef55790e7ca88eda", features = ["serde"], optional = true}
+zipkin-reporter-http = {git = "https://github.com/vavrusa/rust-zipkin", rev = "c856015ff2bbee50b533198aef55790e7ca88eda", optional = true}
 http = "0.1"

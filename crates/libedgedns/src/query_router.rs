@@ -157,11 +157,6 @@ impl QueryRouter {
     }
 
     pub async fn resolve(&self, mut scope: Scope, answer: BytesMut) -> Result<BytesMut> {
-        // Set tracing span
-        if let Some(span) = self.tracer.new_span(&scope.question) {
-            scope.set_trace_span(span);
-        }
-
         // Update metrics
         let varz = varz::current();
         varz.client_queries.inc();
@@ -193,6 +188,11 @@ impl QueryRouter {
                 self.resolve_from_cache(&scope, entry, answer)
             }
             None => {
+                // Set tracing span
+                if let Some(span) = self.tracer.new_span(&scope.question) {
+                    scope.set_trace_span(span);
+                }
+
                 // Route the request to respective handler
                 let res = match &self.router {
                     QueryRouterVariant::Recursor(recursor) => {

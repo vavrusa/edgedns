@@ -366,10 +366,7 @@ extern "C" fn local_socket_open(ptr: i32, len: i32, ctx: &mut Ctx) -> i32 {
 
     // Create a new task if not reconnecting
     trace!("[{}] connecting local stream {:?}", instance, path);
-    let src = GuestStream {
-        instance: instance.clone(),
-        task_handle: task_id,
-    };
+    let src = GuestStream::new(instance.clone(),task_id);
 
     // Open connection to local socket, and connect guest stream to sink
     tokio::spawn(

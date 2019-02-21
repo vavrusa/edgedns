@@ -1,5 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use core::ffi::c_void;
+use futures::future::Shared;
+use futures::sync::oneshot::{channel, Receiver, Sender};
 use guest;
 use libedgedns::{Context, Scope};
 use log::*;
@@ -25,11 +27,18 @@ pub enum CallError {
 pub struct InstanceWrapper {
     name: String,
     inner: Mutex<wasmer_runtime::Instance>,
-    context: Arc<Context>,                         // server context
-    request_states: RwLock<Slab<RequestState>>,    // indexed by request_id
-    guest_futures: RwLock<Slab<GuestFutureState>>, // guest registered futures
-    scheduled_queue: Mutex<Vec<usize>>,            // list of future ID to run
-    callback_message: RwLock<GuestCallback>,       // function to call on each message
+    /// server context
+    context: Arc<Context>,
+    /// indexed by request_id
+    request_states: RwLock<Slab<RequestState>>,
+    /// guest registered futures
+    guest_futures: RwLock<Slab<GuestFutureState>>,
+    /// list of future ID to run
+    scheduled_queue: Mutex<Vec<usize>>,
+    /// function to call on each message
+    callback_message: RwLock<GuestCallback>,
+    /// channel to cancel all the futures spawned by the instance
+    cancel: (Mutex<Option<Sender<()>>>, Shared<Receiver<()>>),
 }
 
 unsafe impl Send for InstanceWrapper {}
@@ -72,6 +81,10 @@ pub fn instantiate(name: String, data: &[u8], context: Arc<Context>) -> error::R
             guest_futures: RwLock::new(Slab::new()),
             request_states: RwLock::new(Slab::new()),
             callback_message: RwLock::new(GuestCallback::default()),
+            cancel: {
+                let (s, r) = channel();
+                (Mutex::new(Some(s)), r.shared())
+            },
         });
         {
             let mut i = instance.inner.lock();
@@ -85,23 +98,21 @@ pub fn instantiate(name: String, data: &[u8], context: Arc<Context>) -> error::R
 /// Start an instance by calling the function `run`.
 pub fn run(instance: Instance) -> impl Future<Item = (), Error = CallError> {
     match instance.inner.lock().call("run", &[]) {
-        Ok(_) => future::Either::A(spawned_futures(instance.clone())),
+        Ok(_) => future::Either::A({
+            let mut queue = instance.scheduled_queue.lock();
+            let vec: Vec<GuestFuture> = queue
+                .iter()
+                .map(|task_handle| {
+                    trace!("[{}] scheduling guest future #{}", instance, *task_handle);
+                    GuestFuture::new(instance.clone(), *task_handle)
+                })
+                .collect();
+            queue.clear();
+
+            future::join_all(vec).then(move |_| Ok::<(), CallError>(()))
+        }),
         Err(e) => future::Either::B(future::err(CallError::VM(e))),
     }
-}
-
-fn spawned_futures(instance: Instance) -> impl Future<Item = (), Error = CallError> {
-    let mut queue = instance.scheduled_queue.lock();
-    let vec: Vec<GuestFuture> = queue
-        .iter()
-        .map(|task_handle| {
-            trace!("[{}] scheduling guest future #{}", instance, *task_handle);
-            GuestFuture::new(instance.clone(), *task_handle)
-        })
-        .collect();
-    queue.clear();
-
-    future::join_all(vec).then(move |_| Ok::<(), CallError>(()))
 }
 
 /// Run instance registered hook.
@@ -132,15 +143,17 @@ pub fn run_hook(
             // The closure registered a future
             let instance_clone = instance.clone();
             match instance.scheduled_queue.lock().pop() {
-                Some(task_handle) => future::Either::B(
-                    GuestFuture::new(instance.clone(), task_handle).then(move |res| {
+                Some(task_handle) => future::Either::B({
+                    let mut fut = GuestFuture::new(instance.clone(), task_handle);
+                    fut.request_id = Some(request_id);
+                    fut.then(move |res| {
                         let (_, answer) = instance_clone.request_states.write().remove(request_id);
                         match res {
                             Ok(action) => Ok((answer, guest::Action::from(action))),
                             Err(e) => Err(CallError::IO(e)),
                         }
-                    }),
-                ),
+                    })
+                }),
                 // Closure did not register a future, something must be wrong
                 None => {
                     drop(instance_clone.request_states.write().remove(request_id));
@@ -161,6 +174,10 @@ pub fn run_hook(
 impl InstanceWrapper {
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    pub fn cancel(&self) {
+        *self.cancel.0.lock() = None;
     }
 
     fn create_task(&self) -> usize {
@@ -246,11 +263,24 @@ struct GuestFutureState {
 pub struct GuestFuture {
     instance: Instance,
     task_handle: usize,
+    request_id: Option<usize>,
+    cancel: Shared<Receiver<()>>,
 }
 
 struct GuestStream {
     instance: Instance,
     task_handle: usize,
+    cancel: Shared<Receiver<()>>,
+}
+
+impl GuestStream {
+    fn new(instance: Instance, task_handle: usize) -> Self {
+        Self {
+            cancel: instance.cancel.1.clone(),
+            instance,
+            task_handle,
+        }
+    }
 }
 
 impl Stream for GuestStream {
@@ -258,6 +288,17 @@ impl Stream for GuestStream {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.cancel.poll() {
+            Ok(p) => {
+                if p.is_ready() {
+                    return Err(Error::new(ErrorKind::Other, "future canceled"));
+                }
+            }
+            Err(_) => {
+                return Err(Error::new(ErrorKind::Other, "future canceled"));
+            }
+        }
+
         match self.instance.get_tasks_mut().get_mut(self.task_handle) {
             Some(GuestFutureState {
                 ref mut data,
@@ -334,8 +375,21 @@ impl Drop for GuestStream {
 impl GuestFuture {
     fn new(instance: Instance, task_handle: usize) -> Self {
         Self {
+            cancel: instance.cancel.1.clone(),
             instance,
             task_handle,
+            request_id: None,
+        }
+    }
+}
+
+impl Drop for GuestFuture {
+    fn drop(&mut self) {
+        if let Some(id) = self.request_id {
+            let mut states = self.instance.request_states.write();
+            if states.contains(id) {
+                states.remove(id);
+            }
         }
     }
 }
@@ -345,6 +399,17 @@ impl Future for GuestFuture {
     type Error = std::io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.cancel.poll() {
+            Ok(p) => {
+                if p.is_ready() {
+                    return Err(Error::new(ErrorKind::Other, "future canceled"));
+                }
+            }
+            Err(_) => {
+                return Err(Error::new(ErrorKind::Other, "future canceled"));
+            }
+        }
+
         let cb = match self.instance.get_tasks().get(self.task_handle) {
             Some(ref state) => state.cb,
             _ => return Err(ErrorKind::NotFound.into()),

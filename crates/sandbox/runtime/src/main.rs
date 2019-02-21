@@ -189,7 +189,9 @@ fn file_reloader(
             match instantiate(name.clone(), &data, context.clone()) {
                 Ok(instance) => {
                     let mut ns = module_ns.lock();
-                    ns.insert(wasm_file, instance.clone());
+                    if let Some(i) = ns.insert(wasm_file, instance.clone()){
+                        i.cancel();
+                    };
                     let scheduled = run(instance.clone());
                     future::Either::A(scheduled)
                 }

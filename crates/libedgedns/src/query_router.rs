@@ -28,7 +28,7 @@ lazy_static! {
 /// It keeps the client query and source information, as well as a reference
 /// to the context on which it was created.
 ///
-/// ```rust
+/// ```rust,no_run
 /// #![feature(await_macro, async_await, futures_api)]
 /// use tokio::await;
 /// use domain_core::bits::{Dname, Question, SectionBuilder, MessageBuilder};

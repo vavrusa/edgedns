@@ -16,3 +16,6 @@ debug = true
 [profile.bench]
 debug = true
 panic = 'abort'
+
+[profile.test]
+debug = true

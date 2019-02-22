@@ -148,6 +148,7 @@ mod zipkin_tracer {
                 })),
             }
         }
+
         /// Discard the trace, which prevents it from being reported.
         /// This is useful when deciding whether to report a span after it has been created.
         pub fn discard(&self) {
@@ -158,6 +159,30 @@ mod zipkin_tracer {
         pub fn new_child(&self) -> Self {
             let reporter = self.inner.lock().reporter.clone();
             Self::new(reporter, Some(self.clone()))
+        }
+
+        /// Creates a copy of current span as the next span.
+        pub fn next_span(&self) -> Span {
+            let (next, source) = {
+                let inner = self.inner.lock();
+                let source = inner.span.build();
+                (
+                    Self::new(inner.reporter.clone(), inner.parent.clone()),
+                    source,
+                )
+            };
+
+            {
+                let mut next_inner = next.inner.lock();
+                if let Some(ref name) = source.name() {
+                    next_inner.span.name(name);
+                }
+                if let Some(endpoint) = source.remote_endpoint() {
+                    next_inner.span.remote_endpoint(endpoint.clone());
+                }
+            }
+
+            next
         }
 
         /// Set the span name.
@@ -187,12 +212,6 @@ mod zipkin_tracer {
         /// Add a tag.
         pub fn tag(&self, key: &str, value: &str) {
             self.inner.lock().span.tag(key, value);
-        }
-
-        /// Annotate the span with a value.
-        pub fn annotate(&self, value: &str) {
-            let annotation = zipkin::Annotation::now(value);
-            self.inner.lock().span.annotation(annotation);
         }
 
         fn next_id() -> [u8; 8] {
@@ -275,6 +294,9 @@ mod noop_tracer {
         pub fn discard(&self) {
             unimplemented!()
         }
+        pub fn next_span(&self) -> Span {
+            unimplemented!()
+        }
         pub fn new_child(&self) -> Self {
             unimplemented!()
         }
@@ -288,9 +310,6 @@ mod noop_tracer {
             unimplemented!()
         }
         pub fn tag(&self, _key: &str, _value: &str) {
-            unimplemented!()
-        }
-        pub fn annotate(&self, _value: &str) {
             unimplemented!()
         }
     }

@@ -11,6 +11,7 @@ use futures::stream::Stream;
 use futures::sync::{mpsc, oneshot};
 use lazy_static::lazy_static;
 use log::*;
+use native_tls;
 use parking_lot::RwLock;
 use socket2::{Domain, Socket, Type};
 use std::cmp;
@@ -27,7 +28,10 @@ use tokio::net::{tcp, TcpStream, UdpSocket};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
 use tokio::timer::Delay;
+use tokio_tls;
 
+/// IANA reserved port for DNS over TLS.
+const DNS_OVER_TLS_PORT: u16 = 853;
 /// Extra allowed time for each try to account for variability;
 const DEFAULT_EXCHANGE_EXTRA: Duration = Duration::from_millis(50);
 /// Default timeout for single message exchange
@@ -406,6 +410,7 @@ impl ConnectionMetrics {
     }
 
     fn update_rtt(&self, address: &SocketAddr, rtt: Duration) {
+        trace!("upstream {:?} responded in {:?}", address, rtt);
         let mut inner = self.inner.write();
         match inner.get_mut(address) {
             Some(metrics) => metrics.update(rtt),
@@ -416,17 +421,14 @@ impl ConnectionMetrics {
     }
 }
 
-/// Exchanger that supports TCP for message exchanges.
-/// If the configuration enables it, it reuses connections.
-#[derive(Clone)]
-struct TcpExchanger {
+/// General purpose that supports opportunistic connection reuse and aggressive retries.
+struct AnyExchanger {
     timetable: Timetable,
     connection_reuse: bool,
     connection_concurrency: usize,
-    with_udp_fallback: bool,
 }
 
-impl Exchanger for TcpExchanger {
+impl Exchanger for AnyExchanger {
     fn exchange(
         &self,
         scope: &Scope,
@@ -434,243 +436,119 @@ impl Exchanger for TcpExchanger {
         origin: Arc<Origin>,
         pending: &PendingQuery,
     ) -> ExchangeFuture {
-        // Make sure there's at least one address in the origin
         let selection = origin.get_scoped(scope, &self.timetable);
-        if selection.is_empty() {
-            return Box::new(future::err(ErrorKind::NotFound.into()));
-        }
-        let num_choices = selection.len();
-
-        // Clone inner variables because Futures 0.1 only support borrows with 'static
-        let timetable = self.timetable.clone();
-        let origin_name = origin.name();
-
-        // Each nameserver tries to lookup expected RTT based on past tries,
-        // if there's no previous information stored, it will use a fixed delay until the timeout.
-        // The tries are staged as follows:
-        //
-        // Start                                                   Timeout
-        // -> Q1.....Q2..............Q3......Q4....................]
-        //         ^               ^       ^
-        //         Q1: Expected RTT|       |
-        //                         | Q2: Expected RTT
-        //                                 | Q3: Expected RTT
-        //           ^
-        //           Start Q2
-        //                            ^ Start Q3
-        //                                   ^ Start Q4
-        //           ^ Start UDP fallback
-        //
-        let mut next_delay = Duration::new(0, 0);
-        let default_step = DEFAULT_EXCHANGE_TIMEOUT / (num_choices + 1) as u32;
-        let retry_plan = selection.iter().enumerate().map(move |(try_num, addr)| {
+        let tries = cmp::min(selection.len(), 2);
+        let default_expected_rtt = DEFAULT_EXCHANGE_TIMEOUT / tries as u32;
+        let mut retries = Retransmitter::new();
+        for addr in selection.iter().cycle().take(tries) {
             // Estimate expected RTT + extra time to account for variability
-            let expected_rtt = match timetable.get_metrics(addr) {
-                Some(metrics) => {
-                    cmp::min(metrics.mean_rtt().add(DEFAULT_EXCHANGE_EXTRA), default_step)
-                }
-                None => default_step,
+            let expected_rtt = match self.timetable.get_metrics(addr) {
+                Some(metrics) => cmp::min(
+                    metrics.mean_rtt().add(DEFAULT_EXCHANGE_EXTRA),
+                    default_expected_rtt,
+                ),
+                None => default_expected_rtt,
             };
 
-            let addr = *addr;
-            let query_clone = query.clone();
-            let timetable = timetable.clone();
-            let trace_span = pending.trace_span.clone();
-            let origin_name = origin_name.to_owned();
+            // Schedule a try for current address
+            let (addr, query, origin) = (addr.to_owned(), query.clone(), origin.clone());
+            let timetable = self.timetable.clone();
+            let span = pending.trace_span.clone();
+            let exchange = future::lazy(move || {
+                // Trace the individual subrequest
+                let instant = Instant::now();
+                // Try to reuse an already open connection
+                match timetable.get_open_connection(&addr) {
+                    Some(sender) => {
+                        trace!("reusing connection to to {:?}", addr);
+                        let span = trace_span_new(&span, "reused-exchange", origin.name(), &addr);
+                        let try_reuse = exchange_with_open_connection(sender, query.clone())
+                            .and_then(move |(message, peer_addr)| {
+                                trace_span_close(span, &message);
+                                // Update response RTT
+                                timetable.update_rtt(&peer_addr, instant.elapsed());
+                                varz::current().upstream_reused.inc();
+                                Ok((message, peer_addr, None))
+                            });
 
-            // Delay the next query by an expected RTT
-            let started = Instant::now().add(next_delay);
-            next_delay = next_delay.add(expected_rtt);
-
-            // The UDP fallback starts after the first query response doesn't arrive on time
-            let try_udp_fallback =
-                self.with_udp_fallback && try_num == cmp::min(1, num_choices - 1);
-            let udp_fallback_start_time = if try_num == 0 {
-                started.add(expected_rtt)
-            } else {
-                started
-            };
-
-            // Attempt to do a message exchange
-            Delay::new(started)
-                .map_err(move |_| ErrorKind::Other.into())
-                .and_then(move |_| {
-                    let varz = varz::current();
-                    varz.upstream_sent.inc();
-
-                    // Trace the individual subrequest
-                    let trace_span = match trace_span {
-                        Some(ref span) => {
-                            Some(span.new_child().with_name("tcp").with_remote_endpoint(&origin_name, addr))
-                        }
-                        None => None,
-                    };
-
-                    // TODO: raise RTT for all previous attempts to least now()
-                    // Check if a connection to this upstream is already open
-                    let try_connect_or_reuse = match timetable.get_open_connection(&addr) {
-                        Some(sender) => {
-                            trace!("reusing connection to to {:?}", addr);
-                            if let Some(ref span) = trace_span {
-                                span.annotate("reused");
-                            }
-                            Either::A(
-                                exchange_with_open_connection(sender, query_clone.clone())
-                                    .and_then(move |(msg, _peer_addr)| {
-                                        varz.upstream_reused.inc();
-                                        Ok((msg, None))
-                                    }),
-                            )
-                        }
-                        None => {
-                            trace!("connecting to {:?}", addr);
-                            Either::B(
-                                exchange_with_tcp(&addr, query_clone.clone())
-                                    .map(move |(msg, stream)| (msg, Some(stream))),
-                            )
-                        }
-                    };
-
-                    // Do the message exchange, and try the optional fallback to UDP if it doesn't finish in time
-                    let try_exchange_or_fallback = if try_udp_fallback {
-                        let try_fallback = Delay::new(udp_fallback_start_time)
-                            .map_err(move |_| ErrorKind::Other.into())
-                            .and_then(move |_| {
-                                debug!("fallback to UDP with {:?}", addr);
-                                exchange_with_udp(addr, query_clone.clone())
-                            })
-                            .map(move |(msg, _)| (msg, None));
-                        Either::A(
-                            future::select_ok(vec![
-                                Either::A(try_connect_or_reuse),
-                                Either::B(try_fallback),
-                            ])
-                            .and_then(move |(res, _v)| Ok(res)),
-                        )
-                    } else {
-                        Either::B(try_connect_or_reuse)
-                    };
-
-                    // Run the future, and update metrics
-                    try_exchange_or_fallback.then(move |res| match res {
-                        Ok((message, maybe_stream)) => {
-                            // Annotate the subrequest trace span
-                            if let Some(ref span) = trace_span {
-                                span.tag("dns.rcode", &format!("{}", message.header().rcode()));
-                                if maybe_stream.is_none() {
-                                    span.annotate("fallback");
-                                }
-                            }
-
-                            // Update connection metrics
-                            let elapsed = started.elapsed();
-                            timetable.update_rtt(&addr, elapsed);
-                            trace!("response from {} in {:?}", addr, elapsed);
-                            Ok((message, maybe_stream, addr))
-                        }
-                        Err(e) => {
-                            debug!("error while talking to {}: {}", addr, e);
-                            // Annotate the subrequest span
-                            if let Some(ref span) = trace_span {
-                                span.tag("error.message", &e.to_string());
-                            }
-                            Err(e)
-                        }
-                    })
-                })
-        });
-
-        let exchanger = self.clone();
-        Box::new(future::select_ok(retry_plan).and_then(
-            move |((message, maybe_stream, peer_addr), _retry_plan)| {
-                // Save connection if connection reuse is enabled
-                if let Some(mut stream) = maybe_stream {
-                    if exchanger.connection_reuse {
-                        // Save connection in pending queue
-                        let (sender, receiver) = mpsc::channel(exchanger.connection_concurrency);
-                        if exchanger.timetable.add_open_connection(peer_addr, sender) {
-                            tokio::spawn(keep_open_connection(
-                                exchanger.timetable.clone(),
-                                stream,
-                                receiver,
-                                peer_addr,
-                                exchanger.connection_concurrency,
-                            ));
-                        }
-                    // Close connection as early as possible if not
-                    } else if let Err(e) = stream.close() {
-                        warn!("error when closing connection {:?}", e);
+                        Either::A(try_reuse)
                     }
-                }
-                // Add response to result set
-                Ok((message, peer_addr))
-            },
-        ))
-    }
-}
-
-/// Exchanger that supports UDP for message exchanges.
-struct UdpExchanger {
-    timetable: Timetable,
-}
-
-impl Exchanger for UdpExchanger {
-    fn exchange(
-        &self,
-        scope: &Scope,
-        query: Message,
-        origin: Arc<Origin>,
-        _pending: &PendingQuery,
-    ) -> ExchangeFuture {
-        let selection = origin.get_scoped(scope, &self.timetable);
-        let exchange_timeout = DEFAULT_EXCHANGE_TIMEOUT / selection.len() as u32;
-        let varz = varz::current();
-        let query_clone = query.clone();
-        Box::new(
-            // Iterate through all addresses in selection
-            stream::iter_ok::<_, IoError>(selection.to_vec())
-                .and_then(move |addr| {
-                    // Attempt to do a message exchange
-                    varz.upstream_sent.inc();
-                    // TODO: implement the variant with reusing a pool of bound sockets
-                    exchange_with_udp(addr, query.clone())
-                        .timeout(exchange_timeout)
-                        .then(move |res| match res {
-                            Ok((message, peer_addr)) => Ok(Some((message, peer_addr))),
-                            Err(e) => {
-                                info!("error while talking to {}: {}", addr, e);
-                                Ok(None)
+                    None => {
+                        let try_send = match addr.port() {
+                            DNS_OVER_TLS_PORT => {
+                                trace!("sending message to {:?} with TLS", addr);
+                                let span =
+                                    trace_span_new(&span, "tls-exchange", origin.name(), &addr);
+                                Either::A(
+                                    exchange_with_tls(addr, query.clone(), addr.ip().to_string())
+                                        .then(move |res| {
+                                            trace_finish(timetable, span, instant, res)
+                                        }),
+                                )
                             }
-                        })
-                })
-                // Continue iterating if the query didn't resolve to answer
-                .skip_while(move |res| future::ok(res.is_none()))
-                // Terminate stream after first successful answer
-                .take(1)
-                // Finish the in-flight query
-                .fold(Vec::new(), move |mut acc, res| {
-                    if let Some((message, peer_addr)) = res {
-                        // Retry with TCP on truncation, otherwise finish
-                        if message.header().tc() {
-                            return Either::A(
-                                exchange_with_tcp(&peer_addr, query_clone.clone()).and_then(
-                                    move |(message, _stream)| {
-                                        let mut acc = Vec::new();
-                                        acc.push((message, peer_addr));
-                                        future::ok(acc)
+                            _ => {
+                                trace!("sending message to {:?} with UDP", addr);
+                                let span =
+                                    trace_span_new(&span, "udp-exchange", origin.name(), &addr);
+                                Either::B(exchange_with_udp(addr, query.clone()).and_then(
+                                    move |(message, (addr, query))| {
+                                        // Update response RTT
+                                        timetable.update_rtt(&addr, instant.elapsed());
+                                        // Retry with TCP on truncation, otherwise finish.
+                                        if !message.header().tc() {
+                                            Either::A(future::ok((message, addr, None)))
+                                        } else {
+                                            let instant = Instant::now();
+                                            let span = span.and_then(|s| {
+                                                Some(s.next_span().with_name("tcp-exchange"))
+                                            });
+                                            Either::B(exchange_with_tcp(addr, query).then(
+                                                move |res| {
+                                                    trace_finish(timetable, span, instant, res)
+                                                },
+                                            ))
+                                        }
                                     },
-                                ),
-                            );
-                        } else {
-                            acc.push((message, peer_addr));
+                                ))
+                            }
+                        };
+
+                        Either::B(try_send)
+                    }
+                }
+            });
+
+            retries.schedule(Box::new(exchange), expected_rtt);
+        }
+
+        let timetable = self.timetable.clone();
+        let enable_connection_reuse = self.connection_reuse;
+        let connection_concurrency = self.connection_concurrency;
+
+        Box::new(
+            retries
+                .into_future()
+                .map(move |(message, addr, maybe_stream)| {
+                    // Save connection if connection reuse is enabled
+                    if let Some(mut stream) = maybe_stream {
+                        if enable_connection_reuse {
+                            // Save connection in pending queue
+                            let (sender, receiver) = mpsc::channel(100);
+                            if timetable.add_open_connection(addr, sender) {
+                                tokio::spawn(keep_open_connection(
+                                    timetable,
+                                    stream,
+                                    receiver,
+                                    addr,
+                                    connection_concurrency,
+                                ));
+                            }
+                        // Close connection as early as possible if not
+                        } else if let Err(e) = stream.close() {
+                            warn!("error when closing connection {:?}", e);
                         }
                     }
-                    Either::B(future::ok::<_, IoError>(acc))
-                })
-                // Return an error if no upstream is available
-                .and_then(move |mut results| match results.pop() {
-                    Some(res) => Ok(res),
-                    None => Err(ErrorKind::NotFound.into()),
+                    (message, addr)
                 }),
         )
     }
@@ -779,16 +657,11 @@ impl Builder {
             metrics: Arc::new(ConnectionMetrics::new(DEFAULT_CONNECTIONS_TRACKED)),
         };
 
-        let exchanger: Arc<Exchanger> = if self.enable_tcp {
-            Arc::new(TcpExchanger {
+        let exchanger: Arc<Exchanger> = if self.enable_udp || self.enable_tcp {
+            Arc::new(AnyExchanger {
                 timetable: timetable.clone(),
                 connection_reuse,
                 connection_concurrency: self.connection_concurrency,
-                with_udp_fallback: self.enable_udp,
-            })
-        } else if self.enable_udp {
-            Arc::new(UdpExchanger {
-                timetable: timetable.clone(),
             })
         } else {
             Arc::new(NoopExchanger {
@@ -857,6 +730,170 @@ impl PendingQueue {
         }
 
         None
+    }
+}
+
+/// Any boxed `ExchangeFuture` (either stream or stream-less).
+type ExchangeFutureExt =
+    Box<dyn Future<Item = (Message, SocketAddr, Option<FramedStream>), Error = IoError> + Send>;
+
+/// Retransmitter has a queue of scheduled tries, and executes them based on the expected RTT.Add
+///
+/// Each nameserver tries to lookup expected RTT based on past tries,
+/// if there's no previous information stored, it will use a fixed delay for the expected RTT.
+/// The tries are staged as follows:
+///
+/// Start                                                   Timeout
+/// -> Q1.....Q2..............Q3......Q4....................]
+///         ^               ^       ^
+///         Q1: Expected RTT|       |
+///                         | Q2: Expected RTT
+///                                 | Q3: Expected RTT
+///           ^
+///           Start Q2
+///                            ^ Start Q3
+///                                   ^ Start Q4
+struct Retransmitter {
+    timeout: Option<Delay>,
+    scheduled: VecDeque<(ExchangeFutureExt, Duration)>,
+    pending: Vec<ExchangeFutureExt>,
+}
+
+impl Retransmitter {
+    /// Create a new retransmitter.
+    fn new() -> Self {
+        Self {
+            timeout: None,
+            scheduled: VecDeque::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Schedule an exchange operation with an expected grace period.
+    fn schedule(&mut self, retry: ExchangeFutureExt, timeout: Duration) {
+        self.scheduled.push_back((retry, timeout));
+    }
+}
+
+impl Future for Retransmitter {
+    type Item = (Message, SocketAddr, Option<FramedStream>);
+    type Error = IoError;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let mut schedule_next = false;
+        loop {
+            // Find a first ready or errored retry
+            let first_ready = self
+                .pending
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, f)| match f.poll() {
+                    Ok(Async::NotReady) => None,
+                    Ok(Async::Ready(item)) => Some((i, Ok(item))),
+                    Err(e) => Some((i, Err(e))),
+                })
+                .next();
+
+            if let Some((id, res)) = first_ready {
+                // Finish if some future is ready
+                if let Ok(item) = res {
+                    return Ok(Async::Ready(item));
+                }
+                // Schedule next retry if the last (most recent) errored
+                if let Err(e) = res {
+                    debug!("retransmit {} future error: {:?}", id, e);
+                    if id == self.pending.len() - 1 {
+                        schedule_next = true;
+                    }
+                }
+                drop(self.pending.remove(id));
+            } else {
+                // No retry is ready, continue with scheduling
+                break;
+            }
+        }
+
+        // Check if we can start a next scheduled retry
+        let schedule_next = schedule_next
+            || match self.timeout {
+                Some(ref mut t) => t.poll().ok().map(|r| r.is_ready()).unwrap_or(false),
+                None => !self.scheduled.is_empty(),
+            };
+
+        // Start the next try if necessary
+        if schedule_next {
+            if let Some((fut, timeout)) = self.scheduled.pop_front() {
+                trace!(
+                    "retransmit scheduling {}, grace period {:?}",
+                    self.pending.len(),
+                    timeout
+                );
+                self.pending.push(fut);
+                let instant = Instant::now().add(timeout);
+                if let Some(ref mut delay) = self.timeout {
+                    delay.reset(instant);
+                } else {
+                    self.timeout = Some(Delay::new(instant));
+                }
+                // We pushed a new retry, so we must poll again
+                return self.poll();
+            } else {
+                self.timeout = None;
+            }
+        }
+
+        Ok(Async::NotReady)
+    }
+}
+
+/// Create a new trace span for message exchange.
+fn trace_span_new(
+    parent: &Option<tracing::Span>,
+    name: &str,
+    service: &str,
+    addr: &SocketAddr,
+) -> Option<tracing::Span> {
+    match parent {
+        Some(ref span) => Some(
+            span.new_child()
+                .with_name(name)
+                .with_remote_endpoint(&service, *addr),
+        ),
+        None => None,
+    }
+}
+
+/// Close a trace span with response.
+fn trace_span_close(mut span: Option<tracing::Span>, msg: &Message) {
+    if let Some(ref mut span) = span {
+        span.tag("dns.rcode", &format!("{}", msg.header().rcode()));
+    }
+}
+
+/// Close a trace span with an error.
+fn trace_span_close_err(mut span: Option<tracing::Span>, err: &IoError) {
+    if let Some(ref mut span) = span {
+        span.tag("error", "true");
+        span.tag("error.message", &err.to_string());
+    }
+}
+
+fn trace_finish(
+    timetable: Timetable,
+    span: Option<tracing::Span>,
+    instant: Instant,
+    res: Result<(Message, SocketAddr, Option<FramedStream>), IoError>,
+) -> Result<(Message, SocketAddr, Option<FramedStream>), IoError> {
+    match res {
+        Ok((message, addr, maybe_stream)) => {
+            trace_span_close(span, &message);
+            timetable.update_rtt(&addr, instant.elapsed());
+            Ok((message, addr, maybe_stream))
+        }
+        Err(e) => {
+            trace_span_close_err(span, &e);
+            Err(e)
+        }
     }
 }
 
@@ -993,27 +1030,54 @@ fn create_tcp_connection(addr: &SocketAddr) -> tcp::ConnectFuture {
 
 /// Returns a future that tries to perform a message exchange over a new TCP connection.
 fn exchange_with_tcp(
-    addr: &SocketAddr,
+    addr: SocketAddr,
     query: Message,
-) -> impl Future<Item = (Message, FramedStream), Error = IoError> {
-    create_tcp_connection(addr)
-        .map(move |stream| {
-            // Disable Nagle and convert to framed transport
-            drop(stream.set_nodelay(true));
-            tcp_framed_transport(stream)
+) -> impl Future<Item = (Message, SocketAddr, Option<FramedStream>), Error = IoError> {
+    create_tcp_connection(&addr).and_then(move |stream| {
+        // Disable Nagle and convert to framed transport
+        drop(stream.set_nodelay(true));
+        let stream = tcp_framed_transport(stream);
+        exchange_with_stream(stream, addr, query)
+    })
+}
+
+/// Returns a future that tries to perform a message exchange over a new TCP connection.
+fn exchange_with_tls(
+    addr: SocketAddr,
+    query: Message,
+    domain: String,
+) -> impl Future<Item = (Message, SocketAddr, Option<FramedStream>), Error = IoError> {
+    let connector = native_tls::TlsConnector::builder().build().unwrap();
+    let connector: tokio_tls::TlsConnector = connector.into();
+    create_tcp_connection(&addr)
+        .and_then(move |stream| {
+            trace!("handshake with {:?}, domain: {}", addr, domain);
+            connector
+                .connect(&domain, stream)
+                .map_err(|e| IoError::new(ErrorKind::Other, e))
         })
         .and_then(move |stream| {
-            stream
-                .send(query.as_slice().into())
-                .and_then(move |stream| {
-                    stream.into_future().map_err(move |_e| {
-                        IoError::new(ErrorKind::UnexpectedEof, "no response within timeout")
-                    })
-                })
+            let stream = tls_framed_transport(stream);
+            exchange_with_stream(stream, addr, query)
+        })
+}
+
+/// Returns a future that tries to perform a message exchange over a new TCP connection.
+fn exchange_with_stream(
+    stream: FramedStream,
+    addr: SocketAddr,
+    query: Message,
+) -> impl Future<Item = (Message, SocketAddr, Option<FramedStream>), Error = IoError> {
+    stream
+        .send(query.as_slice().into())
+        .and_then(move |stream| {
+            stream.into_future().map_err(move |_e| {
+                IoError::new(ErrorKind::UnexpectedEof, "no response within timeout")
+            })
         })
         .and_then(move |(response, stream)| match response {
             Some(response) => match Message::from_bytes(response.into()) {
-                Ok(message) => Ok((message, stream)),
+                Ok(message) => Ok((message, addr, Some(stream))),
                 Err(_e) => Err(IoError::new(ErrorKind::InvalidData, "invalid response")),
             },
             None => Err(IoError::new(
@@ -1032,7 +1096,7 @@ fn get_local_addr(ipv6: bool) -> SocketAddr {
 fn exchange_with_udp(
     addr: SocketAddr,
     query: Message,
-) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
+) -> impl Future<Item = (Message, (SocketAddr, Message)), Error = IoError> {
     let local_addr = get_local_addr(addr.is_ipv6());
     let socket = UdpSocket::bind(&local_addr).expect("bound socket");
     udp_framed_transport(socket)
@@ -1056,7 +1120,7 @@ fn exchange_with_udp(
                 // Parse the response into message and unblock waiting futures
                 .and_then(move |(response, _stream)| match response {
                     Some(response) => match Message::from_bytes(response.into()) {
-                        Ok(message) => Ok((message, addr)),
+                        Ok(message) => Ok((message, (addr, query))),
                         Err(_e) => Err(IoError::new(
                             ErrorKind::InvalidData,
                             "received invalid message",
@@ -1072,17 +1136,74 @@ fn exchange_with_udp(
 
 #[cfg(test)]
 mod test {
-    use super::{Builder, Conductor};
+    use super::{Builder, Conductor, Retransmitter};
     use crate::query_router::Scope;
     use crate::test_utils::{test_echo_server, TestOrigin, DOMAINS};
+    use bytes::Bytes;
     use domain_core::bits::*;
     use domain_core::iana::*;
     use std::net::SocketAddr;
+    use std::ops::Add;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use test::{black_box, Bencher};
+    use tokio::await;
     use tokio::prelude::*;
     use tokio::runtime::current_thread::Runtime;
+    use tokio::timer::Delay;
+
+    #[test]
+    fn retransmitter() {
+        let now = Instant::now();
+        let f0 = Delay::new(now.add(Duration::from_millis(200))).then(|_| {
+            let addr = "127.0.0.1:1".parse::<SocketAddr>().unwrap();
+            let msg = Message::from_bytes(Bytes::from_static(&[0u8; 12])).unwrap();
+            Ok((msg, addr, None))
+        });
+        let f1 = future::lazy(|| Err(std::io::ErrorKind::UnexpectedEof.into()));
+        let f2 = future::lazy(|| {
+            let addr = "127.0.0.1:2".parse::<SocketAddr>().unwrap();
+            let msg = Message::from_bytes(Bytes::from_static(&[1u8; 12])).unwrap();
+            Ok((msg, addr, None))
+        });
+
+        let mut retry = Retransmitter::new();
+        tokio::run_async(
+            async move {
+                // Schedule tries with the same grace period
+                retry.schedule(Box::new(f0), Duration::from_millis(100));
+                retry.schedule(Box::new(f1), Duration::from_millis(100));
+                retry.schedule(Box::new(f2), Duration::from_millis(100));
+
+                // Waiting on first delayed future, nothing should be returned
+                match retry.poll() {
+                    Ok(Async::NotReady) => {}
+                    _ => {
+                        assert!(false);
+                    }
+                }
+
+                let _ = await!(Delay::new(now.add(Duration::from_millis(10))));
+                match retry.poll() {
+                    Ok(Async::NotReady) => {}
+                    _ => {
+                        assert!(false);
+                    }
+                }
+
+                // Grace period passes, second + third future should be polled
+                // Second future is an error, so the Retransmitter should continue polling
+                // and return the third scheduled future.
+                let _ = await!(Delay::new(now.add(Duration::from_millis(150))));
+                match retry.poll() {
+                    Ok(Async::Ready(_)) => {} // Ready
+                    _ => {
+                        assert!(false);
+                    }
+                }
+            },
+        );
+    }
 
     const MAX_TEST_DURATION: Duration = Duration::from_millis(60_000);
 

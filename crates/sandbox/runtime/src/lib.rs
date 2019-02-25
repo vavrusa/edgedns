@@ -7,6 +7,7 @@ use libedgedns::{Context, Scope};
 use log::*;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use slab::Slab;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -96,20 +97,14 @@ pub fn instantiate(name: String, data: &[u8], context: Arc<Context>) -> error::R
 }
 
 /// Start an instance by calling the function `run`.
-pub fn run(instance: Instance) -> impl Future<Item = (), Error = CallError> {
+pub fn run(instance: &Instance) -> impl Future<Item = (), Error = CallError> {
     match instance.inner.lock().call("run", &[]) {
         Ok(_) => future::Either::A({
-            let mut queue = instance.scheduled_queue.lock();
-            let vec: Vec<GuestFuture> = queue
-                .iter()
-                .map(|task_handle| {
-                    trace!("[{}] scheduling guest future #{}", instance, *task_handle);
-                    GuestFuture::new(instance.clone(), *task_handle)
-                })
-                .collect();
-            queue.clear();
+            let mut guest_tasks = instance.scheduled_queue.lock();
+            let guest_future = GuestFuture::new(instance.clone()).with_tasks(&*guest_tasks);
+            guest_tasks.clear();
 
-            future::join_all(vec).then(move |_| Ok::<(), CallError>(()))
+            guest_future.map(|_| ()).map_err(CallError::IO)
         }),
         Err(e) => future::Either::B(future::err(CallError::VM(e))),
     }
@@ -117,57 +112,47 @@ pub fn run(instance: Instance) -> impl Future<Item = (), Error = CallError> {
 
 /// Run instance registered hook.
 pub fn run_hook(
-    instance: Instance,
-    scope: Scope,
+    instance: &Instance,
+    scope: &Scope,
     answer: BytesMut,
 ) -> impl Future<Item = (BytesMut, guest::Action), Error = CallError> {
     // Check if callback is installed
     let cb = instance.callback_message.read();
 
     // Register request state
-    let request_id = instance.request_states.write().insert((scope, answer));
+    let req = GuestFuture::new(instance.clone()).with_request(scope, answer.clone());
 
     // Instantiate a future to drive the guest-side future
-    match cb.call(instance.clone(), Some(request_id as i32)) {
+    match cb.call(&instance, Some(req.request_id.unwrap() as i32)) {
         Ok(values) => {
             // Check if task finished eagerly
             if let Some(Value::I32(res)) = values.first() {
                 if let guest::Async::Ready(action) = guest::Async::from(*res) {
                     instance.scheduled_queue.lock().pop();
-                    let (_, answer) = instance.request_states.write().remove(request_id);
                     return future::Either::A(future::ok((answer, action.into())));
                 }
             };
 
-            // TODO: forbid creating multiple futures from closure
-            // The closure registered a future
-            let instance_clone = instance.clone();
+            // The closure registered a future, if the guest registered multiple tasks,
+            // they will be executed sequentially.
             match instance.scheduled_queue.lock().pop() {
                 Some(task_handle) => future::Either::B({
-                    let mut fut = GuestFuture::new(instance.clone(), task_handle);
-                    fut.request_id = Some(request_id);
-                    fut.then(move |res| {
-                        let (_, answer) = instance_clone.request_states.write().remove(request_id);
-                        match res {
-                            Ok(action) => Ok((answer, guest::Action::from(action))),
-                            Err(e) => Err(CallError::IO(e)),
+                    req.with_tasks(&[task_handle]).then(move |res| match res {
+                        Ok((action, request)) => {
+                            let answer = request.expect("request state").1;
+                            Ok((answer, guest::Action::from(action)))
                         }
+                        Err(e) => Err(CallError::IO(e)),
                     })
                 }),
                 // Closure did not register a future, something must be wrong
-                None => {
-                    drop(instance_clone.request_states.write().remove(request_id));
-                    future::Either::A(future::err(CallError::IO(Error::new(
-                        ErrorKind::InvalidInput,
-                        "closure does not return a future",
-                    ))))
-                }
+                None => future::Either::A(future::err(CallError::IO(Error::new(
+                    ErrorKind::InvalidInput,
+                    "closure does not return a future",
+                )))),
             }
         }
-        Err(message) => {
-            drop(instance.request_states.write().remove(request_id));
-            future::Either::A(future::err(message))
-        }
+        Err(message) => future::Either::A(future::err(message)),
     }
 }
 
@@ -228,7 +213,7 @@ impl GuestCallback {
     }
 
     /// Call the guest callback through an indirect call.
-    fn call(&self, instance: Instance, request_id: Option<i32>) -> Result<Vec<Value>, CallError> {
+    fn call(&self, instance: &Instance, request_id: Option<i32>) -> Result<Vec<Value>, CallError> {
         if !self.is_valid() {
             return Err(CallError::IO(ErrorKind::NotFound.into()));
         }
@@ -260,13 +245,6 @@ struct GuestFutureState {
 }
 
 /// Future representing a guest generated stream of items.
-pub struct GuestFuture {
-    instance: Instance,
-    task_handle: usize,
-    request_id: Option<usize>,
-    cancel: Shared<Receiver<()>>,
-}
-
 struct GuestStream {
     instance: Instance,
     task_handle: usize,
@@ -366,36 +344,80 @@ impl Stream for GuestStream {
 
 impl Drop for GuestStream {
     fn drop(&mut self) {
-        trace!("[{}], dropping stream #{}", self.instance, self.task_handle);
+        trace!("[{}] dropping stream #{}", self.instance, self.task_handle);
         drop(self.instance.remove_task(self.task_handle))
     }
 }
 
 /// Future representing an asynchronous guest computation.
+pub struct GuestFuture {
+    instance: Instance,
+    task_queue: VecDeque<usize>,
+    request_id: Option<usize>,
+    cancel: Shared<Receiver<()>>,
+}
+
 impl GuestFuture {
-    fn new(instance: Instance, task_handle: usize) -> Self {
+    fn new(instance: Instance) -> Self {
         Self {
             cancel: instance.cancel.1.clone(),
             instance,
-            task_handle,
+            task_queue: VecDeque::new(),
             request_id: None,
+        }
+    }
+
+    /// Add guest task queue to the future.
+    fn with_tasks(mut self, task_queue: &[usize]) -> Self {
+        self.task_queue.extend(task_queue);
+        self
+    }
+
+    /// Associate the future with the host request, the guest future takes ownership of the request.
+    fn with_request(mut self, scope: &Scope, answer: BytesMut) -> Self {
+        let request_id = self
+            .instance
+            .request_states
+            .write()
+            .insert((scope.clone(), answer));
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// Returns the host request associated with this future.
+    fn request(&self) -> Option<RequestState> {
+        match self.request_id {
+            Some(request_id) => self.instance.get_requests().get(request_id).cloned(),
+            None => None,
+        }
+    }
+
+    /// Finish current guest task from the future, and remove it from the task queue.
+    fn finish_current_task(&mut self) -> Option<GuestFutureState> {
+        match self.task_queue.pop_front() {
+            Some(task_handle) => Some(self.instance.remove_task(task_handle)),
+            None => None,
         }
     }
 }
 
 impl Drop for GuestFuture {
     fn drop(&mut self) {
+        trace!("[{}] dropping future #{:?}", self.instance, self.task_queue);
         if let Some(id) = self.request_id {
             let mut states = self.instance.request_states.write();
             if states.contains(id) {
                 states.remove(id);
             }
         }
+        for task_handle in self.task_queue.iter() {
+            drop(self.instance.remove_task(*task_handle))
+        }
     }
 }
 
 impl Future for GuestFuture {
-    type Item = guest::AsyncValue;
+    type Item = (guest::AsyncValue, Option<RequestState>);
     type Error = std::io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -410,14 +432,26 @@ impl Future for GuestFuture {
             }
         }
 
-        let cb = match self.instance.get_tasks().get(self.task_handle) {
+        // Get next task callback from the queue
+        let task_handle = match self.task_queue.front() {
+            Some(task_handle) => *task_handle,
+            None => {
+                trace!("[{}] guest future no tasks to poll", self.instance);
+                return Err(ErrorKind::UnexpectedEof.into());
+            }
+        };
+
+        trace!("[{}] guest future polling #{}", self.instance, task_handle);
+
+        // Get guest callback for the next task
+        let cb = match self.instance.get_tasks().get(task_handle) {
             Some(ref state) => state.cb,
-            _ => return Err(ErrorKind::NotFound.into()),
+            None => return Err(ErrorKind::NotFound.into()),
         };
 
         // Poll guest future. The poller fn is not exported, so it can't be called directly,
         // so we use a built-in trampoline function to call it.
-        match cb.call(self.instance.clone(), None) {
+        match cb.call(&self.instance, None) {
             Ok(values) => {
                 // Parse the async result code.
                 let state = match values.first() {
@@ -427,28 +461,37 @@ impl Future for GuestFuture {
                 trace!(
                     "[{}] guest future #{} return: {:?}",
                     self.instance,
-                    self.task_handle,
+                    task_handle,
                     state
                 );
                 match state {
                     guest::Async::NotReady => Ok(Async::NotReady),
-                    guest::Async::Error(_) => {
-                        // TODO: map guest side error
-                        let _ = self.instance.remove_task(self.task_handle);
-                        Err(ErrorKind::Other.into())
+                    guest::Async::Error(e) => {
+                        drop(self.finish_current_task());
+                        Err(Error::new(ErrorKind::Other, e.to_string()))
                     }
                     guest::Async::Ready(v) => {
-                        let _ = self.instance.remove_task(self.task_handle);
-                        Ok(Async::Ready(v))
+                        drop(self.finish_current_task());
+                        if self.task_queue.is_empty() {
+                            Ok(Async::Ready((v, self.request())))
+                        } else {
+                            trace!(
+                                "[{}] guest future #{} finished as subtask: {:?}",
+                                self.instance,
+                                task_handle,
+                                v
+                            );
+                            Ok(Async::NotReady)
+                        }
                     }
                 }
             }
             Err(message) => {
                 warn!(
                     "[{}] guest future #{} trap: {:?}",
-                    self.instance, self.task_handle, message
+                    self.instance, task_handle, message
                 );
-                let _ = self.instance.remove_task(self.task_handle);
+                drop(self.finish_current_task());
                 Err(ErrorKind::Other.into())
             }
         }

@@ -125,23 +125,23 @@ fn main() {
                     message.finish()
                 };
 
+                if hook_disabled {
+                    return Either::A(future::ok((answer.into(), from)));
+                }
+
                 // Process message
-                let ns = module_ns.lock();
-                if hook_disabled || !ns.contains_key(&wasm_file) {
-                    Either::A(future::ok((answer.into(), from)))
-                } else {
-                    Either::B(
-                        run_hook(ns.get(&wasm_file).unwrap().clone(), scope, answer.clone()).then(
-                            move |res| {
-                                trace!("processed hook: {:?}", res);
-                                if let Ok((answer, _action)) = res {
-                                    Ok((answer.into(), from))
-                                } else {
-                                    Ok((answer.into(), from))
-                                }
-                            },
-                        ),
-                    )
+                match module_ns.lock().get(&wasm_file) {
+                    Some(ref instance) => Either::B(
+                        run_hook(&instance, &scope, answer.clone()).then(move |res| {
+                            trace!("processed hook: {:?}", res);
+                            if let Ok((answer, _action)) = res {
+                                Ok((answer.into(), from))
+                            } else {
+                                Ok((answer.into(), from))
+                            }
+                        }),
+                    ),
+                    None => Either::A(future::ok((answer.into(), from))),
                 }
             })
             .forward(sink)
@@ -188,12 +188,12 @@ fn file_reloader(
                 .into();
             match instantiate(name.clone(), &data, context.clone()) {
                 Ok(instance) => {
+                    trace!("instantiated {}", wasm_file);
                     let mut ns = module_ns.lock();
-                    if let Some(i) = ns.insert(wasm_file, instance.clone()){
+                    if let Some(i) = ns.insert(wasm_file, instance.clone()) {
                         i.cancel();
                     };
-                    let scheduled = run(instance.clone());
-                    future::Either::A(scheduled)
+                    future::Either::A(run(&instance))
                 }
                 Err(e) => {
                     error!("failed to reload {}: {:?}", wasm_file, e);

@@ -4,7 +4,7 @@ use crate::context::Context;
 use crate::error::Result;
 use crate::forwarder::Forwarder;
 use crate::recursor::Recursor;
-use crate::server::Protocol;
+use crate::codecs::Protocol;
 use crate::tracing;
 use crate::varz;
 use bytes::{Bytes, BytesMut};
@@ -54,6 +54,7 @@ pub struct Scope {
     pub query: Message,
     pub question: Question<ParsedDname>,
     pub peer_addr: SocketAddr,
+    pub local_addr: Option<SocketAddr>,
     protocol: Protocol,
     pub(crate) trace_span: Option<tracing::Span>,
 }
@@ -64,6 +65,7 @@ impl Clone for Scope {
             query: self.query.clone(),
             question: self.question.clone(),
             peer_addr: self.peer_addr,
+            local_addr: self.local_addr,
             protocol: self.protocol,
             trace_span: None,
         }
@@ -81,6 +83,7 @@ impl Scope {
                     query,
                     question,
                     peer_addr,
+                    local_addr: None,
                     protocol: Protocol::default(),
                     trace_span: None,
                 })
@@ -96,8 +99,14 @@ impl Scope {
     }
 
     /// Set transport protocol used in this scope
-    pub fn with_protocol(&mut self, protocol: Protocol) -> &mut Self {
+    pub fn set_protocol(&mut self, protocol: Protocol) -> &mut Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// Set local address on which the request is served.
+    pub fn set_local_addr(&mut self, local_addr: SocketAddr) -> &mut Self {
+        self.local_addr = Some(local_addr);
         self
     }
 
@@ -141,6 +150,16 @@ impl QueryRouter {
         }
     }
 
+    /// Spawns the query router start in the default executor.
+    pub fn spawn(me: Arc<QueryRouter>, tripwire: Tripwire) {
+        tokio::spawn_async(
+            async move {
+                await!(me.start(tripwire));
+            },
+        );
+    }
+
+    /// Starts the query router.
     pub async fn start(&self, tripwire: Tripwire) {
         debug!("starting query router");
         let context = self.context.clone();
@@ -156,6 +175,7 @@ impl QueryRouter {
         }
     }
 
+    /// Resolve the DNS request and serialize the answer in provided buffer.
     pub async fn resolve(&self, mut scope: Scope, answer: BytesMut) -> Result<BytesMut> {
         // Update metrics
         let varz = varz::current();

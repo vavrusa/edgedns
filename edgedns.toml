@@ -31,12 +31,18 @@ max_ttl = 86400
 
 
 [network]
-# Max number of UDP ports to use for outgoing connections, up to 64511
-udp_ports = 8
-
-# Listen address
+# Listen address (can be a single address, or an table of named listeners)
 listen = "0.0.0.0:53"
 
+# For example, an additional TLS interface would be configured as:
+#
+# [network.listen.dns]
+# address = "0.0.0.0:53"
+#
+# [network.listen.dot]
+# address = "0.0.0.0:853"
+# tls = ["cert.p1", "password"]
+listen = "0.0.0.0:53"
 
 [webservice]
 # Change to `true` in order to start the webservice
@@ -44,17 +50,6 @@ enabled = false
 
 # Webservice address for Prometheus. Path will be /metrics
 listen = "0.0.0.0:9090"
-
-
-[dnstap]
-# Change to `true` in order to enable dnstap-based logging
-enabled = false
-
-# Backlog
-# backlog = 4096
-
-# UNIX socket path, relative to the chroot directory
-socket_path = "/var/run/edgedns.dnstap"
 
 
 [global]
@@ -97,18 +92,11 @@ max_upstream_connections = 1000
 version = "EdgeDNS"
 
 
-[hooks]
-# Base directory for the dynamic libraries
-basedir = "."
-
-# UNIX socket to control the server from the CLI
-socket_path = "/tmp/edgedns.sock"
-
 [tracing]
-# Enable tracing requests with Zipkin.
+# Enable tracing requests with OpenTracing.
 enabled = false
 
-# Reporter collector configuration (URL).
+# Zipkin reporter collector configuration (URL).
 # reporter_url = "http://localhost:9411"
 
 # Sampling rate for the reporter (0.0 - 1.0).

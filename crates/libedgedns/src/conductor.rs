@@ -939,7 +939,7 @@ fn keep_open_connection(
                 }
             })
             .map_err(move |_| ErrorKind::BrokenPipe.into())
-            .fold(sink, move |sink, msg| sink.send(msg))
+            .fold(sink, move |sink, msg| sink.send((msg, peer_addr)))
             .then(move |_: Result<_, IoError>| Ok::<_, ()>(()))
     };
 
@@ -948,7 +948,7 @@ fn keep_open_connection(
         stream
             .timeout(DEFAULT_KEEPALIVE / 2)
             .map_err(move |_e| ErrorKind::TimedOut.into())
-            .for_each(move |resp| {
+            .for_each(move |(resp, peer_addr)| {
                 // Parse response and attempt to close pending queries
                 let tokens = if let Ok(msg) = Message::from_bytes(resp.into()) {
                     let key = CacheKey::from(&msg);
@@ -1036,7 +1036,7 @@ fn exchange_with_tcp(
     create_tcp_connection(&addr).and_then(move |stream| {
         // Disable Nagle and convert to framed transport
         drop(stream.set_nodelay(true));
-        let stream = tcp_framed_transport(stream);
+        let stream = FramedStream::from(stream);
         exchange_with_stream(stream, addr, query)
     })
 }
@@ -1057,7 +1057,7 @@ fn exchange_with_tls(
                 .map_err(|e| IoError::new(ErrorKind::Other, e))
         })
         .and_then(move |stream| {
-            let stream = tls_framed_transport(stream);
+            let stream = FramedStream::from(stream);
             exchange_with_stream(stream, addr, query)
         })
 }
@@ -1069,15 +1069,15 @@ fn exchange_with_stream(
     query: Message,
 ) -> impl Future<Item = (Message, SocketAddr, Option<FramedStream>), Error = IoError> {
     stream
-        .send(query.as_slice().into())
+        .send((query.as_slice().into(), addr))
         .and_then(move |stream| {
             stream.into_future().map_err(move |_e| {
                 IoError::new(ErrorKind::UnexpectedEof, "no response within timeout")
             })
         })
         .and_then(move |(response, stream)| match response {
-            Some(response) => match Message::from_bytes(response.into()) {
-                Ok(message) => Ok((message, addr, Some(stream))),
+            Some((response, peer_addr)) => match Message::from_bytes(response.into()) {
+                Ok(message) => Ok((message, peer_addr, Some(stream))),
                 Err(_e) => Err(IoError::new(ErrorKind::InvalidData, "invalid response")),
             },
             None => Err(IoError::new(
@@ -1099,7 +1099,7 @@ fn exchange_with_udp(
 ) -> impl Future<Item = (Message, (SocketAddr, Message)), Error = IoError> {
     let local_addr = get_local_addr(addr.is_ipv6());
     let socket = UdpSocket::bind(&local_addr).expect("bound socket");
-    udp_framed_transport(socket)
+    FramedStream::from(socket)
         .send((query.as_bytes().clone(), addr))
         .and_then(move |stream| {
             stream

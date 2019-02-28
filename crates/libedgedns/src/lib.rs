@@ -1,7 +1,7 @@
 //! Import all the required crates, instanciate the main components and start
 //! the service.
 #![recursion_limit = "128"]
-#![feature(await_macro, async_await, futures_api, test, non_exhaustive)]
+#![feature(await_macro, async_await, futures_api, test, non_exhaustive, try_from)]
 extern crate test;
 
 mod cache;
@@ -34,7 +34,6 @@ pub const DNS_QUERY_MIN_SIZE: usize = 17;
 pub const DNS_RESPONSE_MIN_SIZE: usize = 17;
 pub const DNS_UDP_NOEDNS0_MAX_SIZE: u16 = 512;
 pub const HEALTH_CHECK_MS: u64 = 10 * 1000;
-pub const MAX_EVENTS_PER_BATCH: usize = 1024;
 pub const MAX_TCP_CLIENTS: usize = 1_000;
 pub const MAX_TCP_HASH_DISTANCE: usize = 10;
 pub const MAX_TCP_IDLE_MS: u64 = 10 * 1000;

@@ -49,20 +49,20 @@ pub fn test_echo_server(timeout: Duration) -> (impl Future<Item = (), Error = ()
 
     // Create futures
     let (sink, stream) = UdpFramed::new(sock, BytesCodec::new()).split();
-    let fut_udp = sink
+    let echo_udp = sink
         .send_all(stream.map(|(msg, addr)| (msg.into(), addr)))
         .timeout(timeout)
         .and_then(|_| Ok(()))
         .map_err(|e| eprintln!("{}", e));
 
-    let fut_tcp = listener
+    let echo_tcp = listener
         .incoming()
         .map_err(|e| eprintln!("failed to accept socket; error = {:?}", e))
         .for_each(|socket| {
-            let (sink, stream) = tcp_framed_transport(socket).split();
+            let (sink, stream) = FramedStream::from(socket).split();
             tokio::spawn(
                 stream
-                    .map(move |msg| msg.into())
+                    .map(move |(msg, addr)| (msg.into(), addr))
                     .forward(sink)
                     .map_err(|err| eprintln!("I/O error: {:?}", err))
                     .and_then(move |(stream, sink)| {
@@ -78,7 +78,7 @@ pub fn test_echo_server(timeout: Duration) -> (impl Future<Item = (), Error = ()
             Ok(())
         });
 
-    (fut_udp.join(fut_tcp).then(|_| Ok(())), local_addr)
+    (echo_udp.join(echo_tcp).then(|_| Ok(())), local_addr)
 }
 
 /// Test origin returning a predefined address

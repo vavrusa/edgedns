@@ -18,7 +18,7 @@ use tokio::prelude::*;
 pub enum LoadBalancingMode {
     Uniform,
     Consistent,
-    // MinLoad,
+    MinLoad,
 }
 
 impl Default for LoadBalancingMode {
@@ -106,12 +106,14 @@ impl Builder {
                 Arc::new(UniformlyDistributedOrigin::new(self.upstream_servers))
             }
             LoadBalancingMode::Consistent => Arc::new(JumpHashOrigin::new(self.upstream_servers)),
+            LoadBalancingMode::MinLoad => Arc::new(MinLoadOrigin::new(self.upstream_servers)),
         };
 
         Forwarder { origin, upstream_total_timeout: self.upstream_total_timeout }
     }
 }
 
+/// Origin implementation with upstream selected with random choice.
 pub struct UniformlyDistributedOrigin {
     pub addresses: Vec<SocketAddr>,
 }
@@ -131,6 +133,7 @@ impl Origin for UniformlyDistributedOrigin {
     }
 }
 
+/// Origin implementation with consistent hashing based on the query name.
 pub struct JumpHashOrigin {
     jumphasher: JumpHasher,
     addresses: Vec<SocketAddr>,
@@ -155,6 +158,29 @@ impl Origin for JumpHashOrigin {
             .jumphasher
             .slot(scope.question.qname(), self.addresses.len() as u32) as usize;
         (&self.addresses[slot..]).to_vec()
+    }
+}
+
+/// Origin implementation with the power of two choices.
+pub struct MinLoadOrigin {
+    addresses: Vec<SocketAddr>,
+}
+
+impl MinLoadOrigin {
+    pub fn new(addresses: Vec<SocketAddr>) -> Self {
+        Self {
+            addresses,
+        }
+    }
+}
+
+impl Origin for MinLoadOrigin {
+    fn get(&self) -> &[SocketAddr] {
+        &self.addresses
+    }
+
+    fn get_scoped(&self, scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+        unimplemented!()
     }
 }
 

@@ -7,8 +7,7 @@ use std::io;
 use std::net;
 use std::result;
 use tokio::timer;
-// use futures::sync::mpsc;
-// use domain_core::bits;
+use native_tls;
 
 /// A specialized `Result` type
 ///
@@ -43,6 +42,18 @@ impl StdError for Error {
     }
 }
 
+impl From<String> for Error {
+    fn from(e: String) -> Error {
+        e.as_str().into()
+    }
+}
+
+impl From<&str> for Error {
+    fn from(e: &str) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Error {
         Error::Io(e)
@@ -71,14 +82,8 @@ impl <T: StdError> From<timer::timeout::Error<T>> for Error {
     }
 }
 
-// impl <T> From<mpsc::SendError<T>> for Error {
-//     fn from(e: mpsc::SendError<T>) -> Error {
-//         io::ErrorKind::BrokenPipe.into()
-//     }
-// }
-
-// impl From<bits::ShortBuf> for Error {
-//     fn from(e: bits::ShortBuf) -> Error {
-//         io::ErrorKind::BrokenPipe.into()
-//     }
-// }
+impl From<native_tls::Error> for Error {
+    fn from(e: native_tls::Error) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::Other, e.description()))
+    }
+}

@@ -8,8 +8,9 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use clap::{App, Arg};
 use coarsetime::Instant;
 use env_logger;
-use libedgedns::{Config, Context, Server};
+use libedgedns::{Config, Context, QueryRouter, Server};
 use log::*;
+use std::sync::Arc;
 use std::time::Duration;
 use stream_cancel::{StreamExt, Tripwire};
 use tokio::prelude::*;
@@ -38,7 +39,7 @@ fn main() {
                 .long("config")
                 .value_name("FILE")
                 .help("Path to the edgedns.toml config file")
-                .takes_value(true)
+                .takes_value(true),
         )
         .get_matches();
 
@@ -64,15 +65,6 @@ fn main() {
 
             // Graceful shutdown trigger
             let (trigger, tripwire) = Tripwire::new();
-            let ctrl_c = tokio_signal::ctrl_c()
-                .flatten_stream()
-                .into_future()
-                .then(move |_| {
-                    info!("shutdown initiated");
-                    drop(trigger);
-                    Ok(())
-                });
-            tokio::spawn(ctrl_c);
 
             // Update coarsetime internal timestamp regularly
             tokio::spawn(
@@ -85,15 +77,30 @@ fn main() {
                     .map_err(|e| eprintln!("failed to update time: {}", e)),
             );
 
+            // Create the query router
+            let query_router = Arc::new(QueryRouter::new(context.clone()));
+            QueryRouter::spawn(query_router.clone(), tripwire.clone());
+
             // Start server
-            let server = Server::new(context.clone(), context.config.max_active_queries);
-            if let Err(e) = server.spawn(tripwire.clone()) {
-                error!("error whilst starting server: {:?}", e)
+            let server = Server::new(context.clone());
+            if let Err(e) = server.spawn(query_router, tripwire.clone()) {
+                panic!("failed to start: {}", e);
             }
 
             // Start the optional webservice
             #[cfg(feature = "webservice")]
             webservice::WebService::spawn(context.clone(), tripwire.clone());
-        }
+
+            // Wait for termination signal
+            let ctrl_c = tokio_signal::ctrl_c()
+                .flatten_stream()
+                .into_future()
+                .then(move |_| {
+                    info!("shutdown initiated");
+                    drop(trigger);
+                    Ok(())
+                });
+            tokio::spawn(ctrl_c);
+        },
     );
 }

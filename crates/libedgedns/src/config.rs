@@ -3,12 +3,16 @@
 //! This configuration cannot currently be updated without restarting the
 //! server.
 
+use crate::error::{Error, Result};
 use crate::forwarder::LoadBalancingMode;
 use http::Uri;
 use log::*;
+use native_tls::{Identity, TlsAcceptor};
+use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::{Error, ErrorKind};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
@@ -32,20 +36,67 @@ impl Default for ServerType {
 
 impl FromStr for ServerType {
     type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         match s {
             "authoritative" => Ok(ServerType::Authoritative),
             "forwarder" => Ok(ServerType::Forwarder),
             "recursive" => Ok(ServerType::Recursive),
-            _ => Err(Error::new(
-                ErrorKind::InvalidData,
-                "Invalid value for the server type",
-            )),
+            _ => Err(Error::from("Invalid value for the server type")),
         }
     }
 }
 
-#[derive(Clone, Debug)]
+/// Configuration for a local listener.
+#[derive(Clone, Default)]
+pub struct Listener {
+    pub address: Option<SocketAddr>,
+    pub tls: Option<TlsAcceptor>,
+}
+
+impl Listener {
+    fn set_tls(&mut self, config: &toml::Value) -> Result<()> {
+        if let Some(tls) = config.get("tls") {
+            // Only pkcs12 certificate is supported currently
+            let cert = match tls.as_array() {
+                Some(x) => {
+                    if x.len() != 2 {
+                        None
+                    } else {
+                        Some((x[0].as_str(), x[1].as_str()))
+                    }
+                }
+                None => None,
+            };
+
+            match cert {
+                Some((Some(cert), Some(pass))) => {
+                    // Load the file from disk
+                    let bytes = read_to_end(cert)?;
+                    let identity = Identity::from_pkcs12(&bytes, &pass)
+                        .map_err(|e| Error::from(format!("failed to load {}: {}", cert, e)))?;
+                    let acceptor = TlsAcceptor::builder(identity).build()?;
+                    self.tls = Some(acceptor);
+                }
+                _ => return Err(Error::from("expected an array with [cert.p12, password]")),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl TryFrom<&str> for Listener {
+    type Error = Error;
+    fn try_from(x: &str) -> Result<Listener> {
+        let address = x.parse::<SocketAddr>()?;
+        Ok(Listener {
+            address: Some(address),
+            tls: None,
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub server_type: ServerType,
     pub decrement_ttl: bool,
@@ -53,8 +104,7 @@ pub struct Config {
     pub lbmode: LoadBalancingMode,
     pub upstream_max_failure_duration: Duration,
     pub cache_size: usize,
-    pub udp_ports: u16,
-    pub listen_addr: String,
+    pub listen: HashMap<String, Listener>,
     pub webservice_enabled: bool,
     pub webservice_listen_addr: String,
     pub min_ttl: u32,
@@ -62,11 +112,6 @@ pub struct Config {
     pub user: Option<String>,
     pub group: Option<String>,
     pub chroot_dir: Option<String>,
-    pub udp_acceptor_threads: usize,
-    pub tcp_acceptor_threads: usize,
-    pub dnstap_enabled: bool,
-    pub dnstap_backlog: usize,
-    pub dnstap_socket_path: Option<String>,
     pub identity: Option<String>,
     pub version: Option<String>,
     pub max_tcp_clients: usize,
@@ -74,8 +119,6 @@ pub struct Config {
     pub max_active_queries: usize,
     pub max_clients_waiting_for_query: usize,
     pub max_upstream_connections: usize,
-    pub hooks_basedir: Option<String>,
-    pub hooks_socket_path: Option<String>,
     pub tracing_enabled: bool,
     pub tracing_reporter_url: Option<Uri>,
     pub tracing_sampling_rate: f64,
@@ -84,6 +127,11 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let mut listen: HashMap<String, Listener> = HashMap::new();
+        listen.insert(
+            "default".to_owned(),
+            Listener::try_from("0.0.0.0:53").unwrap(),
+        );
         Self {
             server_type: ServerType::default(),
             decrement_ttl: true,
@@ -91,8 +139,7 @@ impl Default for Config {
             lbmode: LoadBalancingMode::default(),
             upstream_max_failure_duration: Duration::from_millis(2500),
             cache_size: 250_000,
-            udp_ports: 8,
-            listen_addr: "0.0.0.0:53".to_string(),
+            listen,
             webservice_enabled: false,
             webservice_listen_addr: "0.0.0.0:9090".to_string(),
             min_ttl: 1,
@@ -100,11 +147,6 @@ impl Default for Config {
             user: None,
             group: None,
             chroot_dir: None,
-            udp_acceptor_threads: 1,
-            tcp_acceptor_threads: 1,
-            dnstap_enabled: false,
-            dnstap_backlog: 0,
-            dnstap_socket_path: None,
             identity: None,
             version: None,
             max_tcp_clients: 250,
@@ -112,8 +154,6 @@ impl Default for Config {
             max_active_queries: 100_000,
             max_clients_waiting_for_query: 1_000,
             max_upstream_connections: 500,
-            hooks_basedir: None,
-            hooks_socket_path: None,
             tracing_enabled: false,
             tracing_reporter_url: None,
             tracing_sampling_rate: 0.01,
@@ -123,27 +163,24 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Config> {
         let mut fd = File::open(path)?;
         let mut toml = String::new();
         fd.read_to_string(&mut toml)?;
         Self::from_string(&toml)
     }
 
-    pub fn from_string(toml: &str) -> Result<Config, Error> {
+    pub fn from_string(toml: &str) -> Result<Config> {
         let toml_config = match toml.parse() {
             Ok(toml_config) => toml_config,
             Err(_) => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Syntax error - config file is not valid TOML",
-                ));
+                return Err(Error::from("Syntax error - config file is not valid TOML"));
             }
         };
         Self::parse(&toml_config)
     }
 
-    fn parse(toml_config: &toml::Value) -> Result<Config, Error> {
+    fn parse(toml_config: &toml::Value) -> Result<Config> {
         let config_upstream = toml_config.get("upstream");
         let server_type = config_upstream
             .and_then(|x| x.get("type"))
@@ -179,10 +216,9 @@ impl Config {
         let lbmode = match lbmode_str {
             "uniform" => LoadBalancingMode::Uniform,
             "consistent" => LoadBalancingMode::Consistent,
-            // "minload" => LoadBalancingMode::MinLoad,
+            "minload" => LoadBalancingMode::MinLoad,
             _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
+                return Err(Error::from(
                     "Invalid value for the load balancing/failover strategy",
                 ));
             }
@@ -217,19 +253,41 @@ impl Config {
 
         let config_network = toml_config.get("network");
 
-        let udp_ports = config_network
-            .and_then(|x| x.get("udp_ports"))
-            .map_or(8, |x| {
-                x.as_integer()
-                    .expect("network.udp_ports must be an integer")
-            }) as u16;
-
-        let listen_addr = config_network
+        let listen = config_network
             .and_then(|x| x.get("listen"))
-            .map_or("0.0.0.0:53", |x| {
-                x.as_str().expect("network.listen_addr must be a string")
+            .map(move |x| {
+                let mut t = HashMap::new();
+                match x.as_str() {
+                    Some(x) => {
+                        // Insert single listener
+                        t.insert("default".to_owned(), Listener::try_from(x).unwrap());
+                    }
+                    None => {
+                        // Collect multiple listeners
+                        for (name, opts) in x
+                            .as_table()
+                            .expect("network.listen must be a string or a table")
+                        {
+                            let mut listener = match opts.get("address") {
+                                Some(x) => Listener::try_from(
+                                    x.as_str().expect("network.listen.address must be a string"),
+                                )
+                                .expect("network.listen.address is a valid address"),
+                                None => Listener::default(),
+                            };
+
+                            // Optional TLS configuration
+                            listener
+                                .set_tls(opts)
+                                .expect("network.listen.tls configuration");
+
+                            t.insert(name.clone(), listener);
+                        }
+                    }
+                };
+                t
             })
-            .to_owned();
+            .expect("network.listen must be a set");
 
         let config_webservice = toml_config.get("webservice");
 
@@ -263,20 +321,6 @@ impl Config {
                 .expect("global.chroot must be a string")
                 .to_owned()
         });
-
-        let udp_acceptor_threads = config_global
-            .and_then(|x| x.get("threads_udp"))
-            .map_or(1, |x| {
-                x.as_integer()
-                    .expect("global.threads_udp must be an integer")
-            }) as usize;
-
-        let tcp_acceptor_threads = config_global
-            .and_then(|x| x.get("threads_tcp"))
-            .map_or(1, |x| {
-                x.as_integer()
-                    .expect("global.threads_tcp must be an integer")
-            }) as usize;
 
         let max_tcp_clients =
             config_global
@@ -333,40 +377,6 @@ impl Config {
                 .to_owned()
         });
 
-        let config_dnstap = toml_config.get("dnstap");
-
-        let dnstap_enabled = config_dnstap
-            .and_then(|x| x.get("enabled"))
-            .map_or(false, |x| {
-                x.as_bool().expect("dnstap.enabled must be a boolean")
-            });
-
-        let dnstap_backlog = config_dnstap
-            .and_then(|x| x.get("backlog"))
-            .map_or(4096, |x| {
-                x.as_integer().expect("dnstap.backlog must be an integer")
-            }) as usize;
-
-        let dnstap_socket_path = config_dnstap.and_then(|x| x.get("socket_path")).map(|x| {
-            x.as_str()
-                .expect("dnstap.socket_path must be a string")
-                .to_owned()
-        });
-
-        let config_hooks = toml_config.get("hooks");
-
-        let hooks_basedir = config_hooks.and_then(|x| x.get("basedir")).map(|x| {
-            x.as_str()
-                .expect("hooks.basedir must be a string")
-                .to_owned()
-        });
-
-        let hooks_socket_path = config_hooks.and_then(|x| x.get("socket_path")).map(|x| {
-            x.as_str()
-                .expect("hooks.socket_path must be a string")
-                .to_owned()
-        });
-
         let config_tracing = toml_config.get("tracing");
 
         let tracing_enabled = config_tracing
@@ -401,8 +411,7 @@ impl Config {
             lbmode,
             upstream_max_failure_duration,
             cache_size,
-            udp_ports,
-            listen_addr,
+            listen,
             webservice_enabled,
             webservice_listen_addr,
             min_ttl,
@@ -410,11 +419,6 @@ impl Config {
             user,
             group,
             chroot_dir,
-            udp_acceptor_threads,
-            tcp_acceptor_threads,
-            dnstap_enabled,
-            dnstap_backlog,
-            dnstap_socket_path,
             identity,
             version,
             max_tcp_clients,
@@ -422,12 +426,17 @@ impl Config {
             max_active_queries,
             max_clients_waiting_for_query,
             max_upstream_connections,
-            hooks_basedir,
-            hooks_socket_path,
             tracing_enabled,
             tracing_reporter_url,
             tracing_sampling_rate,
             tracing_only_failures,
         })
     }
+}
+
+fn read_to_end<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut file = File::open(path)?;
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
 }

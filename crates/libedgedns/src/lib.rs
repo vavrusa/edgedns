@@ -13,15 +13,17 @@ mod error;
 pub mod forwarder;
 mod query_router;
 pub mod recursor;
+mod sandbox;
 mod server;
 mod test_utils;
-mod varz;
 mod tracing;
+mod varz;
 
 pub use crate::cache::*;
 pub use crate::conductor::Conductor;
 pub use crate::config::{Config, Listener};
 pub use crate::context::*;
+pub use crate::sandbox::loader::FSLoader;
 pub use crate::query_router::*;
 pub use crate::server::*;
 pub use crate::varz::Varz;

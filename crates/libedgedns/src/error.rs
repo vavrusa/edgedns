@@ -24,12 +24,14 @@ pub type Result<T = ()> = result::Result<T, Error>;
 pub enum Error {
     /// An error that occurred while performing an I/O operation (e.g. while reading from a socket).
     Io(io::Error),
+    Other(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "IO error: {}", e),
+            Error::Other(e) => write!(f, "Other error: {}", e),
         }
     }
 }
@@ -38,6 +40,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Error::Io(e) => Some(e),
+            Error::Other(_) => None,
         }
     }
 }

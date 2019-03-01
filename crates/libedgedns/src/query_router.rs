@@ -1,16 +1,18 @@
 use crate::cache::{CacheEntry, CacheKey};
+use crate::codecs::Protocol;
 use crate::config::ServerType;
 use crate::context::Context;
 use crate::error::Result;
 use crate::forwarder::Forwarder;
 use crate::recursor::Recursor;
-use crate::codecs::Protocol;
+use crate::sandbox::loader::{FSLoader, Phase};
 use crate::tracing;
 use crate::varz;
 use bytes::{Bytes, BytesMut};
 use domain_core::bits::*;
 use domain_core::iana::{Class, Rcode, Rtype};
 use domain_core::rdata::{AllRecordData, Txt};
+use guest::Action;
 use lazy_static::*;
 use log::*;
 use std::io::ErrorKind;
@@ -135,11 +137,12 @@ enum QueryRouterVariant {
 pub struct QueryRouter {
     context: Arc<Context>,
     router: QueryRouterVariant,
+    sandbox: Arc<FSLoader>,
     tracer: Arc<tracing::Tracer>,
 }
 
 impl QueryRouter {
-    pub fn new(context: Arc<Context>) -> Self {
+    pub fn new(context: Arc<Context>, sandbox: Arc<FSLoader>) -> Self {
         let config = &context.config;
         let tracer = Arc::new(tracing::Tracer::from_config(config));
         Self {
@@ -150,6 +153,7 @@ impl QueryRouter {
                 }
             },
             context,
+            sandbox,
             tracer,
         }
     }
@@ -202,7 +206,13 @@ impl QueryRouter {
             _ => {}
         }
 
-        // TODO: Process pre-flight hooks
+        // Process pre-flight phase
+        let (action, answer) = await!(self.sandbox.run_phase(Phase::PreCache, &scope, answer));
+        match action {
+            Action::Deliver => return Ok(answer),
+            Action::Drop => return resolve_to_error(&scope, answer, Rcode::Refused, false),
+            Action::Pass => {},
+        }
 
         let mut cache = self.context.cache.clone();
         let cache_key = CacheKey::from(&scope);

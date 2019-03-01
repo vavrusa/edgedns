@@ -32,7 +32,6 @@ max_ttl = 86400
 
 [network]
 # Listen address (can be a single address, or an table of named listeners)
-listen = "0.0.0.0:53"
 
 # For example, an additional TLS interface would be configured as:
 #
@@ -105,3 +104,16 @@ sampling_rate = 0.01
 
 # Reporter verbosity. By default, the reporter reports only failed requests.
 only_failures = false
+
+[apps]
+# Global settings for sandbox apps and the loader.
+
+# The location where apps should be loaded.
+#location = "/etc/edgedns/apps"
+
+# Interval in second to check for reload. When left empty, no reload
+# will be scheduled.
+#reload_interval_sec = 60
+
+# Enabled app and its configuration.
+#[apps.example]

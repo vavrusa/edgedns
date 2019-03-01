@@ -129,6 +129,9 @@ pub struct Config {
     pub tracing_reporter_url: Option<Uri>,
     pub tracing_sampling_rate: f64,
     pub tracing_only_failures: bool,
+    pub apps_location: Option<String>,
+    pub apps_reload_interval_sec: Option<Duration>,
+    pub apps_config: Option<toml::value::Table>,
 }
 
 impl Default for Config {
@@ -159,6 +162,9 @@ impl Default for Config {
             tracing_reporter_url: None,
             tracing_sampling_rate: 0.01,
             tracing_only_failures: false,
+            apps_location: None,
+            apps_reload_interval_sec: None,
+            apps_config: None,
         }
     }
 }
@@ -408,6 +414,41 @@ impl Config {
                         .expect("tracing.only_failures must be a boolean")
                 });
 
+        let config_apps = toml_config.get("apps");
+        let apps_location = config_apps.and_then(|x| x.get("location")).map(|x| {
+            let s = x.as_str().expect("apps.location must be a string");
+            String::from(s)
+        });
+        let apps_reload_interval_sec =
+            config_apps
+                .and_then(|x| x.get("reload_interval_sec"))
+                .map(|x| {
+                    Duration::from_secs(
+                        x.as_integer()
+                            .expect("apps.reload_interval_sec must be a number")
+                            as u64,
+                    )
+                });
+
+        let apps_config = match config_apps {
+            Some(config) => {
+                let mut t = toml::value::Table::new();
+                if let Some(table) = config.as_table() {
+                    for (k, v) in table.iter() {
+                        if v.is_table() {
+                            t.insert(k.to_string(), v.clone());
+                        }
+                    }
+                }
+                if t.len() > 0 {
+                    Some(t)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
         Ok(Config {
             server_type,
             decrement_ttl,
@@ -434,6 +475,9 @@ impl Config {
             tracing_reporter_url,
             tracing_sampling_rate,
             tracing_only_failures,
+            apps_location,
+            apps_reload_interval_sec,
+            apps_config,
         })
     }
 }

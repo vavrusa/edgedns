@@ -2,7 +2,6 @@
 members = [
 	"crates/libedgedns", 
 	"crates/server",
-	"crates/sandbox/runtime",
 	"crates/sandbox/guest",
 ]
 exclude = [

@@ -8,7 +8,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use clap::{App, Arg};
 use coarsetime::Instant;
 use env_logger;
-use libedgedns::{Config, Context, QueryRouter, Server, Listener};
+use libedgedns::{Config, Context, QueryRouter, Server, Listener, FSLoader};
 use log::*;
 use std::sync::Arc;
 use std::net::SocketAddr;
@@ -83,8 +83,13 @@ fn main() {
                     .map_err(|e| eprintln!("failed to update time: {}", e)),
             );
 
+            // TODO: move module loader into server
+            // Start the module loader
+            let loader = Arc::new(FSLoader::new(context.clone()));
+            FSLoader::spawn(loader.clone(), cancel.clone());
+
             // Create the query router
-            let query_router = Arc::new(QueryRouter::new(context.clone()));
+            let query_router = Arc::new(QueryRouter::new(context.clone(), loader));
             QueryRouter::spawn(query_router.clone(), cancel.clone());
 
             // Start server

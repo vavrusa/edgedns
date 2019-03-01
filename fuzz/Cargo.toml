@@ -9,7 +9,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies.libedgedns]
-path = "../src/libedgedns"
+path = "../crates/libedgedns"
 [dependencies.libfuzzer-sys]
 git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
 

@@ -5,7 +5,7 @@ use crate::context::Context;
 use crate::error::Result;
 use crate::forwarder::Forwarder;
 use crate::recursor::Recursor;
-use crate::sandbox::loader::{FSLoader, Phase};
+use crate::sandbox::{FSLoader, Phase};
 use crate::tracing;
 use crate::varz;
 use bytes::{Bytes, BytesMut};

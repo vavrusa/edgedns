@@ -8,7 +8,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use clap::{App, Arg};
 use coarsetime::Instant;
 use env_logger;
-use libedgedns::{Config, Context, QueryRouter, Server, Listener, FSLoader};
+use libedgedns::{Config, Context, QueryRouter, Server, Listener, sandbox::FSLoader};
 use log::*;
 use std::sync::Arc;
 use std::net::SocketAddr;

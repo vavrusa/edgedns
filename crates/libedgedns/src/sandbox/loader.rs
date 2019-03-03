@@ -3,7 +3,7 @@
 use crate::context::Context;
 use crate::error::Error;
 use crate::query_router::Scope;
-use crate::sandbox::{instantiate, Instance};
+use crate::sandbox::{instantiate, Instance, Phase};
 use bytes::BytesMut;
 use guest::Action;
 use log::*;
@@ -18,12 +18,6 @@ use stream_cancel::{StreamExt, Tripwire};
 use tokio::await;
 use tokio::prelude::*;
 use tokio::timer::Interval;
-
-#[derive(Debug)]
-pub enum Phase {
-    PreCache,
-    PostCache,
-}
 
 type InstanceMap = HashMap<String, (Instance, SystemTime)>;
 

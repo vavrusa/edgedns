@@ -16,7 +16,15 @@ use tokio::prelude::*;
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
 mod host_calls;
-pub mod loader;
+mod loader;
+pub use loader::FSLoader;
+
+/// TODO: docstring
+#[derive(Debug)]
+pub enum Phase {
+    PreCache,
+    PostCache,
+}
 
 #[derive(Debug)]
 pub enum CallError {

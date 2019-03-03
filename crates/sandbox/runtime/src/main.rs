@@ -1,30 +1,19 @@
 #![feature(await_macro, async_await, futures_api)]
-#[cfg(feature = "jemalloc")]
-use jemallocator;
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use bytes::BytesMut;
 use clap::{App, Arg};
 use domain_core::bits::*;
 use env_logger;
-use futures::future::Either;
-use libedgedns::{Config, Context, Scope};
-use libedgedns_sandbox::{instantiate, run, run_hook, CallError, Instance};
+use libedgedns::{sandbox, Config, Context, FramedStream, Scope};
 use log::*;
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::io;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::codec::BytesCodec;
-use tokio::net::{UdpFramed, UdpSocket};
+use stream_cancel::Tripwire;
+use tokio::await;
+use tokio::net::UdpSocket;
 use tokio::prelude::*;
-use tokio::runtime::Runtime;
-use tokio::timer::Interval;
 
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const PKG_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
@@ -54,165 +43,61 @@ fn main() {
                 .help("Listen on given address for queries (example: 127.0.0.1:1053)")
                 .takes_value(true),
         )
-        .arg(
-            Arg::with_name("verify")
-                .short("v")
-                .long("verify")
-                .help("Enable WASM compiler verifier."),
-        )
-        .arg(
-            Arg::with_name("opt_level")
-                .short("o")
-                .long("opt-level")
-                .value_name("SETTINGS")
-                .help("Select optimization level")
-                .possible_values(&["default", "best", "fastest"])
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("disable")
-                .short("x")
-                .long("disable")
-                .help("Disable message processing hooks."),
-        )
         .get_matches();
 
-    let wasm_file = matches.value_of("file").unwrap_or("main.wasm").to_owned();
+    let wasm_file = Path::new(matches.value_of("file").unwrap_or("example.wasm"));
 
-    // TODO(anb): support verify and opt_level
-    // let mut flag_builder = settings::builder();
-    // if matches.is_present("verify") {
-    //     flag_builder.enable("enable_verifier").unwrap();
-    // }
-    // flag_builder
-    //     .set(
-    //         "opt_level",
-    //         matches.value_of("opt_level").unwrap_or("default"),
-    //     )
-    //     .unwrap();
+    // Graceful shutdown trigger
+    let (trigger, tripwire) = Tripwire::new();
+    let context = runtime_context(
+        wasm_file.parent().unwrap(),
+        wasm_file.file_stem().unwrap().to_str().unwrap(),
+    );
 
-    // let isa_builder = cranelift_native::builder().unwrap_or_else(|_| {
-    //     panic!("host machine is not a supported target");
-    // });
-    // let isa = isa_builder.finish(settings::Flags::new(flag_builder));
-    let context = runtime_context();
-    let module_ns = Arc::new(Mutex::new(HashMap::new()));
+    tokio::run_async(
+        async move {
+            // Start the module loader
+            let loader = Arc::new(sandbox::FSLoader::new(context.clone()));
+            sandbox::FSLoader::spawn(loader.clone(), tripwire.clone());
 
-    // Run start function
-    trace!("runtime start");
-    let file_reloader = file_reloader(module_ns.clone(), wasm_file.to_string(), context.clone());
+            // Listen and process incoming messages
+            if let Some(address) = matches.value_of("listen") {
+                info!("processing messages from {}", address);
+                let socket = UdpSocket::bind(&address.parse::<SocketAddr>().unwrap()).unwrap();
 
-    // Listen and process incoming messages
-    if let Some(address) = matches.value_of("listen") {
-        let hook_disabled = matches.is_present("disable");
+                let (mut sink, mut stream) = FramedStream::from(socket).split();
+                while let Some(Ok((msg, from))) = await!(stream.next()) {
+                    let scope = Scope::new(msg.clone().into(), from).expect("scope");
+                    trace!("processing {} bytes from {}", msg.len(), from);
 
-        info!("processing messages from {}", address);
-        let socket = UdpSocket::bind(&address.parse::<SocketAddr>().unwrap()).unwrap();
-        let (sink, stream) = UdpFramed::new(socket, BytesCodec::new()).split();
-        let fut = stream
-            .and_then(move |(msg, from)| {
-                let scope = Scope::new(msg.clone().into(), from).expect("scope");
-                trace!("processing {} bytes from {}", msg.len(), from);
-
-                // Create a response builder
-                let answer = {
-                    let mut message = MessageBuilder::from_buf(BytesMut::with_capacity(512));
-                    let header = message.header_mut();
-                    *header = *scope.query.header();
-                    header.set_id(scope.query.header().id());
-                    header.set_qr(true);
-                    message.push(scope.question.clone()).unwrap();
-                    message.finish()
-                };
-
-                if hook_disabled {
-                    return Either::A(future::ok((answer.into(), from)));
-                }
-
-                // Process message
-                match module_ns.lock().get(&wasm_file) {
-                    Some(ref instance) => Either::B(
-                        run_hook(&instance, &scope, answer.clone()).then(move |res| {
-                            trace!("processed hook: {:?}", res);
-                            if let Ok((answer, _action)) = res {
-                                Ok((answer.into(), from))
-                            } else {
-                                Ok((answer.into(), from))
-                            }
-                        }),
-                    ),
-                    None => Either::A(future::ok((answer.into(), from))),
-                }
-            })
-            .forward(sink)
-            .and_then(move |_| Ok(()))
-            .map_err(move |e| error!("when processing: {}", e));
-
-        // Spawn both concurrently
-        let mut rt = Runtime::new().unwrap();
-        rt.spawn(file_reloader);
-        rt.spawn(fut);
-        rt.shutdown_on_idle().wait().unwrap();
-    } else {
-        tokio::run(file_reloader);
-    }
-}
-
-fn file_reloader(
-    module_ns: Arc<Mutex<HashMap<String, Instance>>>,
-    wasm_file: String,
-    context: Arc<Context>,
-) -> impl Future<Item = (), Error = ()> {
-    let last_modified = Mutex::new(None);
-    Interval::new_interval(Duration::from_millis(500))
-        .map_err(|_| CallError::IO(io::ErrorKind::Other.into()))
-        .filter_map(move |_| {
-            let metadata = std::fs::metadata(&wasm_file).unwrap();
-            let time = metadata.modified().unwrap();
-            let mut lock_guard = last_modified.lock();
-            if lock_guard.is_none() || lock_guard.unwrap() != time {
-                info!("reloading {}", wasm_file);
-                *lock_guard = Some(time);
-                Some(wasm_file.clone())
-            } else {
-                None
-            }
-        })
-        .and_then(move |wasm_file| {
-            let data = read_to_end(wasm_file.clone().into()).unwrap();
-            let name: String = Path::new(&wasm_file)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .into();
-            match instantiate(name.clone(), &data, context.clone()) {
-                Ok(instance) => {
-                    trace!("instantiated {}", wasm_file);
-                    let mut ns = module_ns.lock();
-                    if let Some(i) = ns.insert(wasm_file, instance.clone()) {
-                        i.cancel();
+                    // Create a response builder
+                    let answer = {
+                        let mut message = MessageBuilder::from_buf(BytesMut::with_capacity(512));
+                        let header = message.header_mut();
+                        *header = *scope.query.header();
+                        header.set_id(scope.query.header().id());
+                        header.set_qr(true);
+                        message.push(scope.question.clone()).unwrap();
+                        message.finish()
                     };
-                    future::Either::A(run(&instance))
-                }
-                Err(e) => {
-                    error!("failed to reload {}: {:?}", wasm_file, e);
-                    future::Either::B(future::ok(()))
+
+                    // Process message
+                    let (action, answer) =
+                        await!(loader.run_hook(sandbox::Phase::PreCache, &scope, answer));
+                    trace!("processed hook: {:?}", action);
+
+                    sink = await!(sink.send((answer.into(), from))).unwrap();
                 }
             }
-        })
-        .for_each(move |_| Ok(()))
-        .map_err(move |e| error!("when processing: {:?}", e))
+        },
+    );
+
+    drop(trigger);
 }
 
-fn runtime_context() -> Arc<Context> {
-    let config = Config::default();
+fn runtime_context(path: &Path, name: &str) -> Arc<Context> {
+    let mut config = Config::default();
+    config.apps_location = Some(path.to_str().unwrap().to_owned());
+    config.apps_reload_interval_sec = Some(Duration::from_millis(500));
     Context::new(config)
-}
-
-fn read_to_end(path: PathBuf) -> Result<Vec<u8>, io::Error> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut file = std::fs::File::open(path)?;
-    file.read_to_end(&mut buf)?;
-    Ok(buf)
 }

@@ -395,6 +395,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgedns-sandbox-runtime"
+version = "0.1.0"
+dependencies = [
+ "bytes 0.4.11 (registry+https://github.com/rust-lang/crates.io-index)",
+ "clap 2.32.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "domain-core 0.4.1 (git+https://github.com/vavrusa/domain-core?rev=0e22a1718048ac0c9498fbe0001cd6677cadcfd7)",
+ "env_logger 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "guest 0.1.0",
+ "libedgedns 0.4.0",
+ "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "stream-cancel 0.4.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio 0.1.15 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "either"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

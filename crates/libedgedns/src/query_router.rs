@@ -55,7 +55,8 @@ pub struct Scope {
     pub question: Question<ParsedDname>,
     pub peer_addr: SocketAddr,
     pub local_addr: Option<SocketAddr>,
-    protocol: Protocol,
+    pub is_internal: bool,
+    pub protocol: Protocol,
     pub(crate) trace_span: Option<tracing::Span>,
 }
 
@@ -66,6 +67,7 @@ impl Clone for Scope {
             question: self.question.clone(),
             peer_addr: self.peer_addr,
             local_addr: self.local_addr,
+            is_internal: self.is_internal,
             protocol: self.protocol,
             trace_span: None,
         }
@@ -84,6 +86,7 @@ impl Scope {
                     question,
                     peer_addr,
                     local_addr: None,
+                    is_internal: false,
                     protocol: Protocol::default(),
                     trace_span: None,
                 })
@@ -105,8 +108,9 @@ impl Scope {
     }
 
     /// Set local address on which the request is served.
-    pub fn set_local_addr(&mut self, local_addr: SocketAddr) -> &mut Self {
+    pub fn set_local_addr(&mut self, local_addr: SocketAddr, is_internal: bool) -> &mut Self {
         self.local_addr = Some(local_addr);
+        self.is_internal = is_internal;
         self
     }
 

@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
+use std::sync::Arc;
 use toml;
 
 /// EdgeDNS server type definition.
@@ -51,6 +52,7 @@ impl FromStr for ServerType {
 pub struct Listener {
     pub address: Option<SocketAddr>,
     pub tls: Option<TlsAcceptor>,
+    pub internal: bool
 }
 
 impl Listener {
@@ -92,6 +94,7 @@ impl TryFrom<&str> for Listener {
         Ok(Listener {
             address: Some(address),
             tls: None,
+            internal: false,
         })
     }
 }
@@ -104,7 +107,7 @@ pub struct Config {
     pub lbmode: LoadBalancingMode,
     pub upstream_max_failure_duration: Duration,
     pub cache_size: usize,
-    pub listen: HashMap<String, Listener>,
+    pub listen: HashMap<String, Arc<Listener>>,
     pub webservice_enabled: bool,
     pub webservice_listen_addr: String,
     pub min_ttl: u32,
@@ -127,10 +130,10 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let mut listen: HashMap<String, Listener> = HashMap::new();
+        let mut listen: HashMap<String, Arc<Listener>> = HashMap::new();
         listen.insert(
             "default".to_owned(),
-            Listener::try_from("0.0.0.0:53").unwrap(),
+            Arc::new(Listener::try_from("0.0.0.0:53").unwrap()),
         );
         Self {
             server_type: ServerType::default(),
@@ -260,7 +263,7 @@ impl Config {
                 match x.as_str() {
                     Some(x) => {
                         // Insert single listener
-                        t.insert("default".to_owned(), Listener::try_from(x).unwrap());
+                        t.insert("default".to_owned(), Arc::new(Listener::try_from(x).unwrap()));
                     }
                     None => {
                         // Collect multiple listeners
@@ -281,7 +284,12 @@ impl Config {
                                 .set_tls(opts)
                                 .expect("network.listen.tls configuration");
 
-                            t.insert(name.clone(), listener);
+                            // Marking for internal interfaces
+                            listener.internal = opts.get("internal").map_or(false, |x| {
+                                x.as_bool().expect("network.listen.internal must be boolean")
+                            });
+
+                            t.insert(name.clone(), Arc::new(listener));
                         }
                     }
                 };

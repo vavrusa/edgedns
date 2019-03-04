@@ -1,7 +1,7 @@
 use crate::conductor::{Origin, Timetable};
 use crate::config::Config;
-use crate::query_router::Scope;
 use crate::context::Context;
+use crate::query_router::Scope;
 use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
 use domain_core::bits::Message;
 use jumphash::JumpHasher;
@@ -19,6 +19,7 @@ pub enum LoadBalancingMode {
     Uniform,
     Consistent,
     MinLoad,
+    Fallback,
 }
 
 impl Default for LoadBalancingMode {
@@ -30,21 +31,39 @@ impl Default for LoadBalancingMode {
 #[derive(Clone)]
 pub struct Forwarder {
     origin: Arc<Origin>,
-    upstream_total_timeout: Duration,
+    pub mode: LoadBalancingMode,
+    pub upstream_total_timeout: Duration,
 }
 
 impl Forwarder {
+    /// Returns forwarder instance builder.
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
+
+    /// Starts the upstream healthchecks.
     pub async fn start(&self, _context: Arc<Context>, _tripwire: Tripwire) -> Result<(), Error> {
         // TODO: start healthcheck
         Ok(())
     }
 
-    pub fn resolve(&self, context: &Arc<Context>, scope: &Scope) -> impl Future<Item = Message, Error = Error> {
+    /// Resolve the request with the configured upstreams.
+    pub fn resolve(
+        &self,
+        context: &Arc<Context>,
+        scope: &Scope,
+    ) -> impl Future<Item = Message, Error = Error> {
         let conductor = context.conductor.clone();
         conductor
             .resolve(scope, scope.query.clone(), self.origin.clone())
-            .timeout(self.upstream_total_timeout).map_err(|_| ErrorKind::TimedOut.into())
+            .timeout(self.upstream_total_timeout)
+            .map_err(|_| ErrorKind::TimedOut.into())
             .map(move |(message, _from)| message)
+    }
+
+    /// Convert forwarder into the used Origin.
+    pub fn to_origin(&self) -> Arc<Origin> {
+        self.origin.clone()
     }
 }
 
@@ -107,9 +126,31 @@ impl Builder {
             }
             LoadBalancingMode::Consistent => Arc::new(JumpHashOrigin::new(self.upstream_servers)),
             LoadBalancingMode::MinLoad => Arc::new(MinLoadOrigin::new(self.upstream_servers)),
+            LoadBalancingMode::Fallback => Arc::new(FallbackOrigin::new(self.upstream_servers)),
         };
 
-        Forwarder { origin, upstream_total_timeout: self.upstream_total_timeout }
+        Forwarder {
+            origin,
+            mode: self.lbmode,
+            upstream_total_timeout: self.upstream_total_timeout,
+        }
+    }
+}
+
+/// Origin implementation with upstreams selected in order.
+pub struct FallbackOrigin {
+    pub addresses: Vec<SocketAddr>,
+}
+
+impl FallbackOrigin {
+    pub fn new(addresses: Vec<SocketAddr>) -> Self {
+        Self { addresses }
+    }
+}
+
+impl Origin for FallbackOrigin {
+    fn get(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 }
 
@@ -119,10 +160,7 @@ pub struct UniformlyDistributedOrigin {
 }
 
 impl UniformlyDistributedOrigin {
-    pub fn new(mut addresses: Vec<SocketAddr>) -> Self {
-        // Shuffle array with uniform distribution
-        let mut rng = thread_rng();
-        addresses.shuffle(&mut rng);
+    pub fn new(addresses: Vec<SocketAddr>) -> Self {
         Self { addresses }
     }
 }
@@ -130,6 +168,14 @@ impl UniformlyDistributedOrigin {
 impl Origin for UniformlyDistributedOrigin {
     fn get(&self) -> &[SocketAddr] {
         &self.addresses
+    }
+
+    fn get_scoped(&self, _scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+        self.addresses.choose_multiple(&mut thread_rng(), 4).cloned().collect()
+    }
+
+    fn choose(&self, _scope: &Scope) -> Option<&SocketAddr> {
+        self.addresses.choose(&mut thread_rng())
     }
 }
 
@@ -146,6 +192,13 @@ impl JumpHashOrigin {
             addresses,
         }
     }
+
+    /// Returns a slot choice for given scope.
+    fn slot(&self, scope: &Scope) -> usize {
+        self
+            .jumphasher
+            .slot(scope.question.qname(), self.addresses.len() as u32) as usize
+    }
 }
 
 impl Origin for JumpHashOrigin {
@@ -154,10 +207,12 @@ impl Origin for JumpHashOrigin {
     }
 
     fn get_scoped(&self, scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
-        let slot = self
-            .jumphasher
-            .slot(scope.question.qname(), self.addresses.len() as u32) as usize;
+        let slot = self.slot(scope);
         (&self.addresses[slot..]).to_vec()
+    }
+
+    fn choose(&self, scope: &Scope) -> Option<&SocketAddr> {
+        self.addresses.get(self.slot(scope))
     }
 }
 
@@ -168,9 +223,7 @@ pub struct MinLoadOrigin {
 
 impl MinLoadOrigin {
     pub fn new(addresses: Vec<SocketAddr>) -> Self {
-        Self {
-            addresses,
-        }
+        Self { addresses }
     }
 }
 
@@ -243,6 +296,13 @@ mod test {
         // Warmup and test
         bench_closure();
         b.iter(bench_closure);
+    }
+
+    #[bench]
+    fn forward_fallback(b: &mut Bencher) {
+        let builder = Builder::default().with_loadbalancing_mode(LoadBalancingMode::Fallback);
+
+        bench_batched(b, builder)
     }
 
     #[bench]

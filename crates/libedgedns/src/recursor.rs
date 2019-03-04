@@ -2,6 +2,7 @@ use crate::cache::{Cache, CacheKey};
 use crate::conductor::{Origin, Timetable, DEFAULT_EXCHANGE_TIMEOUT};
 use crate::config::Config;
 use crate::context::Context;
+use crate::forwarder::{Forwarder, LoadBalancingMode};
 use crate::query_router::Scope;
 use crate::HEALTH_CHECK_MS;
 use bytes::Bytes;
@@ -27,6 +28,7 @@ const MAX_ITERATIONS_PER_QUERY: usize = 200;
 pub struct Recursor {
     resolver: Arc<kres::Context>,
     cache: Option<Cache>,
+    failover: Option<(Forwarder, Arc<Origin>)>,
 }
 
 impl Recursor {
@@ -41,11 +43,12 @@ impl Recursor {
                     .unwrap()
                     .into(),
             ))
+            .with_failover(&config.upstream_servers_str, config.lbmode)
             .with_verbosity(log_enabled!(Level::Trace))
             .build()
     }
 
-    fn from_builder(builder: &Builder) -> Self {
+    fn from_builder(builder: Builder) -> Self {
         let resolver = kres::Context::new();
         let cache = match builder.cache_size {
             0 => None,
@@ -58,11 +61,55 @@ impl Recursor {
             resolver.add_trust_anchor(&serialized).unwrap();
         }
 
+        // The failover consists of a forwarder and an origin oracle.
+        // The origin oracle decides whether to resolve the request locally,
+        // or using the provided forwarder.
+        let mut failover = None;
+        if let Some(lbmode) = builder.failover_mode {
+            let fwd = Forwarder::builder()
+                .with_upstream_servers(builder.upstream_servers.clone())
+                .with_loadbalancing_mode(lbmode)
+                .build();
+
+            // The origin oracle includes a special local address to identify the local recursion.
+            let mut with_local_choice =
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)];
+            with_local_choice.extend(builder.upstream_servers);
+            let oracle = Forwarder::builder()
+                .with_upstream_servers(with_local_choice)
+                .with_loadbalancing_mode(lbmode)
+                .build()
+                .to_origin();
+
+            failover = Some((fwd, oracle));
+        }
+
         resolver.set_verbose(builder.verbose);
-        Self { resolver, cache }
+        Self {
+            resolver,
+            cache,
+            failover,
+        }
     }
 
     pub async fn start(&self, context: Arc<Context>, tripwire: Tripwire) -> Result<()> {
+        // Start forwarder healtcheck
+        if let Some((ref forwarder, ..)) = self.failover {
+            let forwarder = forwarder.clone();
+            let context = context.clone();
+            let tripwire = tripwire.clone();
+            tokio::spawn_async(
+                async move {
+                    match await!(forwarder.start(context, tripwire)) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("recursor forwarder healthcheck error: {:?}", e);
+                        }
+                    }
+                },
+            );
+        }
+
         let healthcheck = Duration::from_millis(HEALTH_CHECK_MS);
         let mut interval = Interval::new(Instant::now(), healthcheck).take_until(tripwire);
 
@@ -103,6 +150,25 @@ impl Recursor {
         context: &'a Arc<Context>,
         scope: &'a Scope,
     ) -> Result<Message> {
+        // See if the request should be forwarded or resolved locally
+        // Requests arriving on an internal interface are never forwarded to avoid loops
+        let mut try_forward = false;
+        if let Some((ref forwarder, ref oracle)) = self.failover {
+            if let Some(ref choice) = oracle.choose(scope) {
+                // The origin oracle has decided to forward first
+                try_forward = choice.port() != 0 && !scope.is_internal;
+                if try_forward {
+                    trace!("recursor will try to forward first");
+                    match await!(forwarder.resolve(context, scope)) {
+                        Ok(answer) => return Ok(answer),
+                        Err(e) => {
+                            debug!("recursor forward first failed: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         let request = kres::Request::new(self.resolver.clone());
         let mut cache = self.cache.clone();
 
@@ -211,6 +277,13 @@ impl Recursor {
             iterations += 1;
         }
 
+        // Try to fail over if not already forwarded
+        if state == kres::State::FAIL && !try_forward && !scope.is_internal {
+            if let Some((ref forwarder, ..)) = self.failover {
+                return await!(forwarder.resolve(context, scope));
+            }
+        }
+
         // Get final answer
         let buf = request.finish(state).unwrap();
         match Message::from_bytes(buf) {
@@ -261,6 +334,8 @@ impl Origin for PreferenceList {
 pub struct Builder {
     cache_size: usize,
     trust_anchors: Vec<Ds>,
+    upstream_servers: Vec<SocketAddr>,
+    failover_mode: Option<LoadBalancingMode>,
     verbose: bool,
 }
 
@@ -285,9 +360,26 @@ impl Builder {
         self
     }
 
+    /// Add a failover mode to local resolver.
+    /// This can be either configured as a fallback or loadbalancing mode, where
+    /// the queries are sent to configured upstreams if local resolution fails,
+    /// or resolve only a subset of queries locally, based on the configured load balancing mode.
+    pub fn with_failover(
+        mut self,
+        upstream_servers_str: &[String],
+        lbmode: LoadBalancingMode,
+    ) -> Self {
+        self.failover_mode = Some(lbmode);
+        self.upstream_servers = upstream_servers_str
+            .iter()
+            .map(|x| x.parse::<SocketAddr>().unwrap())
+            .collect();
+        self
+    }
+
     /// Convert the Builder into the Recursor with defined configuration.
     pub fn build(self) -> Recursor {
-        Recursor::from_builder(&self)
+        Recursor::from_builder(self)
     }
 }
 

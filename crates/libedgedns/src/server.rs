@@ -1,4 +1,5 @@
 use crate::codecs::*;
+use crate::config::Listener;
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::query_router::{QueryRouter, Scope};
@@ -51,6 +52,7 @@ impl Server {
         connections: Arc<EstablishedConnections>,
         listener: TcpListener,
         tls_acceptor: Option<tokio_tls::TlsAcceptor>,
+        local_endpoint: Arc<Listener>,
         cancel: Tripwire,
     ) {
         let mut incoming = listener.incoming().take_until(cancel.clone());
@@ -85,6 +87,7 @@ impl Server {
                 connections.clone(),
                 stream,
                 peer_addr,
+                local_endpoint.clone(),
                 cancel.clone(),
             );
         }
@@ -94,9 +97,11 @@ impl Server {
     async fn stream_process_sequential(
         router: Arc<QueryRouter>,
         stream: FramedStream,
+        local_endpoint: Arc<Listener>,
         cancel: Tripwire,
     ) {
         let mut buf = BytesMut::with_capacity(DEFAULT_BUF_CAPACITY);
+        let local_addr = stream.local_addr().expect("bound stream");
         let (mut sink, stream) = stream.split();
         let mut stream = stream.take_until(cancel);
         while let Some(Ok((msg, addr))) = await!(stream.next()) {
@@ -105,7 +110,9 @@ impl Server {
                 msg.into(),
                 addr,
                 buf,
-                Protocol::Udp
+                Protocol::Udp,
+                local_addr,
+                &local_endpoint,
             )) {
                 Ok((msg, from)) => {
                     buf = msg;
@@ -138,9 +145,11 @@ impl Server {
         stream: FramedStream,
         sender: mpsc::Sender<(Bytes, SocketAddr)>,
         receiver: mpsc::Receiver<(Bytes, SocketAddr)>,
+        local_endpoint: Arc<Listener>,
         cancel: Tripwire,
     ) {
         let protocol = stream.protocol();
+        let local_addr = stream.local_addr().expect("bound stream");
         let (sink, stream) = stream.split();
 
         // Demultiplex responses back to the TCP stream
@@ -170,6 +179,7 @@ impl Server {
                     // Process message asynchronously
                     let router = router.clone();
                     let sender = sender.clone();
+                    let local_endpoint = local_endpoint.clone();
                     tokio::spawn_async(
                         async move {
                             let buf = BytesMut::with_capacity(INITIAL_BUF_SIZE);
@@ -178,7 +188,9 @@ impl Server {
                                 msg.into(),
                                 peer_addr,
                                 buf,
-                                protocol
+                                protocol,
+                                local_addr,
+                                &local_endpoint,
                             )) {
                                 Ok((response, peer_addr)) => {
                                     match await!(sender.send((response.into(), peer_addr))) {
@@ -210,6 +222,7 @@ impl Server {
         connections: Arc<EstablishedConnections>,
         stream: FramedStream,
         peer_addr: SocketAddr,
+        local_endpoint: Arc<Listener>,
         cancel: Tripwire,
     ) {
         // Reuse TCP slots for each client identified by an IP address
@@ -252,7 +265,7 @@ impl Server {
             async move {
                 trace!("stream client {} processing", peer_addr);
                 await!(Self::stream_process_concurrent(
-                    router, stream, tx, rx, cancel,
+                    router, stream, tx, rx, local_endpoint, cancel,
                 ));
 
                 // Client disconnected, remove the associated connection and close the
@@ -279,20 +292,13 @@ impl Server {
 
     /// Spawn listeners and stream processors from the configuration.
     pub fn spawn(&self, query_router: Arc<QueryRouter>, cancel: Tripwire) -> Result<()> {
-        for (name, listener) in self.context.config.listen.iter() {
-            let addr = match listener.address {
+        for (name, local_endpoint) in self.context.config.listen.iter() {
+            let addr = match local_endpoint.address {
                 Some(x) => x,
                 None => continue,
             };
 
-            match listener.tls {
-                Some(ref tls) => {
-                    self.spawn_tls_listener(addr, TlsAcceptor::from(tls.clone()), query_router.clone(), cancel.clone())
-                },
-                None => {
-                    self.spawn_dns_listener(addr, query_router.clone(), cancel.clone())
-                }
-            }
+            self.spawn_listener(addr, query_router.clone(), local_endpoint.clone(), cancel.clone())
             .map_err(|e| Error::from(format!("failed to listen on {}: {}", addr, e)))?;
 
             info!("listener '{}' bound to {}", name, addr);
@@ -302,12 +308,31 @@ impl Server {
     }
 
     /// Spawn DNS listener and stream processors for given address on UDP and TCP.
-    pub fn spawn_dns_listener(
+    pub fn spawn_listener(
         &self,
         addr: SocketAddr,
         router: Arc<QueryRouter>,
+        local_endpoint: Arc<Listener>,
         cancel: Tripwire,
     ) -> Result<()> {
+        // Spawn TLS listener and stream processors for given address.
+        if let Some(ref tls) = local_endpoint.tls {
+            let acceptor = TlsAcceptor::from(tls.clone());
+            let socket = TcpListener::bind(&addr)?;
+            let connections = self.connections.clone();
+            tokio::spawn_async(Self::listener_accept(
+                self.context.clone(),
+                router.clone(),
+                connections,
+                socket,
+                Some(acceptor),
+                local_endpoint,
+                cancel.clone(),
+            ));
+
+            return Ok(());
+        }
+
         // Spawn a single concurrent handler with higher overhead, and the rest of fast-lane handlers.
         // This serves two purposes:
         //  * The concurrent handler can process many concurrent requests, but requires a channel
@@ -322,6 +347,7 @@ impl Server {
             stream,
             tx,
             rx,
+            local_endpoint.clone(),
             cancel.clone(),
         ));
 
@@ -329,6 +355,7 @@ impl Server {
         tokio::spawn_async(Self::stream_process_sequential(
             router.clone(),
             stream,
+            local_endpoint.clone(),
             cancel.clone(),
         ));
 
@@ -341,28 +368,7 @@ impl Server {
             connections,
             socket,
             None,
-            cancel.clone(),
-        ));
-
-        Ok(())
-    }
-
-    /// Spawn TLS listener and stream processors for given address.
-    pub fn spawn_tls_listener(
-        &self,
-        addr: SocketAddr,
-        acceptor: TlsAcceptor,
-        router: Arc<QueryRouter>,
-        cancel: Tripwire,
-    ) -> Result<()> {
-        let socket = TcpListener::bind(&addr)?;
-        let connections = self.connections.clone();
-        tokio::spawn_async(Self::listener_accept(
-            self.context.clone(),
-            router.clone(),
-            connections,
-            socket,
-            Some(acceptor),
+            local_endpoint,
             cancel.clone(),
         ));
 
@@ -376,11 +382,14 @@ async fn resolve_message<'a>(
     from: SocketAddr,
     response_buf: BytesMut,
     protocol: Protocol,
+    local_address: SocketAddr,
+    local_endpoint: &'a Arc<Listener>,
 ) -> Result<(BytesMut, SocketAddr)> {
     // Create a new request scope
     let result = match Scope::new(msg, from) {
         Ok(mut scope) => {
             scope.set_protocol(protocol);
+            scope.set_local_addr(local_address, local_endpoint.internal);
             await!(router.resolve(scope, response_buf))
         }
         Err(e) => Err(e),

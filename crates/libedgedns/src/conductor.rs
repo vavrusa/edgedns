@@ -69,6 +69,11 @@ pub trait Origin: Send + Sync {
     fn iter(&self) -> Iter<SocketAddr> {
         self.get().iter()
     }
+
+    /// Convenience function to return next selected address.
+    fn choose(&self, _scope: &Scope) -> Option<&SocketAddr> {
+        self.get().first()
+    }
 }
 
 /// The conductor schedules outgoing queries identified by message, and an origin.

@@ -24,7 +24,7 @@ type InstanceMap = HashMap<String, (Instance, SystemTime)>;
 /// A loader to load apps from filesystem.
 ///
 /// It finds the wasm binary from `location`, and tries to reload them
-/// if mtime changes based on the `reload_interval_sec` setting.
+/// if mtime changes based on the `reload_interval` setting.
 pub struct FSLoader {
     context: Arc<Context>,
     loaded: Arc<RwLock<InstanceMap>>,
@@ -49,7 +49,7 @@ impl FSLoader {
         let mut ticker = loader
             .context
             .config
-            .apps_reload_interval_sec
+            .apps_reload_interval
             .map(|duration| Interval::new_interval(duration).take_until(cancel));
 
         while true {
@@ -66,26 +66,6 @@ impl FSLoader {
             }
             break;
         }
-
-        // match loader.context.config.apps_reload_interval_sec {
-        //     Some(duration) => {
-        //         let mut stream = Interval::new_interval(duration).take_until(cancel);
-        //         while let Some(_) = await!(stream.next()) {
-        //             Self::reload_dir(
-        //                 loader.context.clone(),
-        //                 Path::new(&dir),
-        //                 loader.loaded.clone(),
-        //             );
-        //         }
-        //     }
-        //     None => {
-        //         Self::reload_dir(
-        //             loader.context.clone(),
-        //             Path::new(&dir),
-        //             loader.loaded.clone(),
-        //         );
-        //     }
-        // }
     }
 
     /// Spawns a async background reloader.

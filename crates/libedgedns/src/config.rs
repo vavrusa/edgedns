@@ -130,7 +130,7 @@ pub struct Config {
     pub tracing_sampling_rate: f64,
     pub tracing_only_failures: bool,
     pub apps_location: Option<String>,
-    pub apps_reload_interval_sec: Option<Duration>,
+    pub apps_reload_interval: Option<Duration>,
     pub apps_config: Option<toml::value::Table>,
 }
 
@@ -163,7 +163,7 @@ impl Default for Config {
             tracing_sampling_rate: 0.01,
             tracing_only_failures: false,
             apps_location: None,
-            apps_reload_interval_sec: None,
+            apps_reload_interval: None,
             apps_config: None,
         }
     }
@@ -419,7 +419,7 @@ impl Config {
             let s = x.as_str().expect("apps.location must be a string");
             String::from(s)
         });
-        let apps_reload_interval_sec =
+        let apps_reload_interval =
             config_apps
                 .and_then(|x| x.get("reload_interval_sec"))
                 .map(|x| {
@@ -476,7 +476,7 @@ impl Config {
             tracing_sampling_rate,
             tracing_only_failures,
             apps_location,
-            apps_reload_interval_sec,
+            apps_reload_interval,
             apps_config,
         })
     }

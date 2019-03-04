@@ -99,6 +99,6 @@ fn main() {
 fn runtime_context(path: &Path, name: &str) -> Arc<Context> {
     let mut config = Config::default();
     config.apps_location = Some(path.to_str().unwrap().to_owned());
-    config.apps_reload_interval_sec = Some(Duration::from_millis(500));
+    config.apps_reload_interval = Some(Duration::from_millis(500));
     Context::new(config)
 }

@@ -1,4 +1,5 @@
-use crate::{host_calls, to_result, Action, Async, AsyncState, AsyncValue, Error};
+use crate::{host_calls, to_result};
+use crate::{Action, Async, AsyncState, AsyncValue, Error, Phase};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -25,7 +26,11 @@ impl Request {
 
             // Fetch query name
             let res = unsafe {
-                host_calls::request_query_name(self.id, self.buf.as_mut_ptr(), self.buf.len() as i32)
+                host_calls::request_query_name(
+                    self.id,
+                    self.buf.as_mut_ptr(),
+                    self.buf.len() as i32,
+                )
             };
 
             match to_result(res) {
@@ -41,7 +46,7 @@ impl Request {
                         buf_size += 16;
                     }
                     _ => return Err(e),
-                }
+                },
             }
         }
     }
@@ -199,12 +204,14 @@ impl<'a> Future for Forward<'a> {
 }
 
 /// Typed task handle for stream.
-struct StreamHandle (i32);
+struct StreamHandle(i32);
 
 impl StreamHandle {
     /// Ask host for a connected stream to local endpoint.
     pub fn new(path: &str) -> Result<Self, Error> {
-        match to_result(unsafe { host_calls::privileged::local_socket_open(path.as_ptr(), path.len() as i32) }) {
+        match to_result(unsafe {
+            host_calls::privileged::local_socket_open(path.as_ptr(), path.len() as i32)
+        }) {
             Ok(fd) => Ok(Self(fd)),
             Err(e) => Err(e),
         }
@@ -213,14 +220,16 @@ impl StreamHandle {
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
-        unsafe { host_calls::privileged::local_socket_close(self.0); }
+        unsafe {
+            host_calls::privileged::local_socket_close(self.0);
+        }
     }
 }
 
 /// Stream connected to a local endpoint (e.g. local socket).
 pub struct LocalStream {
-    task: StreamHandle
-} 
+    task: StreamHandle,
+}
 
 impl LocalStream {
     /// Create an unconnected stream.
@@ -234,14 +243,16 @@ impl LocalStream {
     /// Ask host for a connected stream to local endpoint.
     pub fn connect(path: &str) -> Result<LocalStream, Error> {
         match StreamHandle::new(path) {
-            Ok(task) => Ok(Self{task}),
-            Err(e) => Err(e)
+            Ok(task) => Ok(Self { task }),
+            Err(e) => Err(e),
         }
     }
 
     /// Poll state of the local stream.
     pub fn poll_state(&self) -> Result<(), Error> {
-        match to_result(unsafe { host_calls::privileged::local_socket_send(self.task.0, core::ptr::null(), 0) }) {
+        match to_result(unsafe {
+            host_calls::privileged::local_socket_send(self.task.0, core::ptr::null(), 0)
+        }) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -255,27 +266,33 @@ use futures::io::{self, AsyncWrite};
 impl AsyncWrite for LocalStream {
     fn poll_write(&mut self, _lw: &LocalWaker, buf: &[u8]) -> Poll<io::Result<usize>> {
         // TODO: split buffer into maximum chunks of 64K as only u16 can be transferred at a time
-        match to_result(unsafe { host_calls::privileged::local_socket_send(self.task.0, buf.as_ptr(), buf.len() as i32) }) {
+        match to_result(unsafe {
+            host_calls::privileged::local_socket_send(self.task.0, buf.as_ptr(), buf.len() as i32)
+        }) {
             Ok(v) => {
                 if v == 0 {
                     Poll::Pending
                 } else {
-                    Poll::Ready(Ok(v as usize))    
+                    Poll::Ready(Ok(v as usize))
                 }
-            },
+            }
             Err(e) => Poll::Ready(Err(io::ErrorKind::Other.into())),
         }
     }
 
     fn poll_flush(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
-        Poll::Ready(self.poll_state().map_err(move |e| io::ErrorKind::Other.into()))
+        Poll::Ready(
+            self.poll_state()
+                .map_err(move |e| io::ErrorKind::Other.into()),
+        )
     }
 
     fn poll_close(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
-        let state = match to_result(unsafe { host_calls::privileged::local_socket_close(self.task.0) }) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(io::ErrorKind::Other.into()),
-        };
+        let state =
+            match to_result(unsafe { host_calls::privileged::local_socket_close(self.task.0) }) {
+                Ok(_) => Ok(()),
+                Err(_) => Err(io::ErrorKind::Other.into()),
+            };
 
         Poll::Ready(state)
     }
@@ -309,7 +326,6 @@ fn poll_future<I: Into<AsyncValue> + 'static, F: Future<Output = Result<I, Error
 fn schedule_future<I: Into<AsyncValue> + 'static>(
     mut future: impl Future<Output = Result<I, Error>> + 'static,
 ) -> Async {
-
     // Try poll to see if the future can complete early.
     match poll_future(&mut future) {
         Async::Ready(v) => return Async::Ready(v),
@@ -324,7 +340,7 @@ fn schedule_future<I: Into<AsyncValue> + 'static>(
             // Free the unregistered closure
             let _ = unsafe { Box::from_raw(closure) };
             Async::Error(e)
-        },
+        }
     }
 }
 
@@ -351,7 +367,9 @@ where
         };
         schedule_future(closure(req)).into()
     });
-    unsafe { host_calls::register_on_message(Box::into_raw(wrapped_closure)) };
+    unsafe {
+        host_calls::register_on_message(Phase::PreCache as i32, Box::into_raw(wrapped_closure))
+    };
 }
 
 /// No-op waker for task notifications.

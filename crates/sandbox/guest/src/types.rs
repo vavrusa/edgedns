@@ -7,6 +7,7 @@ pub type Result = core::result::Result<i32, Error>;
 
 /// Error type for host calls.
 pub enum Error {
+    Ok,
     Unknown,
     Other(String),
     NotFound,
@@ -18,6 +19,7 @@ pub enum Error {
 impl From<Error> for i32 {
     fn from(e: Error) -> i32 {
         match e {
+            Error::Ok => 0,
             Error::Unknown => -1,
             Error::Other(_) => -2,
             Error::NotFound => -3,
@@ -45,6 +47,7 @@ impl From<i32> for Error {
 impl Error {
     pub fn as_str(&self) -> &str {
         match self {
+            Error::Ok => "ok",
             Error::Unknown => "unknown",
             Error::Other(s) => s.as_str(),
             Error::NotFound => "not found",
@@ -180,5 +183,31 @@ impl From<AsyncValue> for Action {
             // 5 => Action::Trace,
             _ => Action::Pass,
         }
+    }
+}
+
+/// Places where guest can register for a callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Phase {
+    Invalid = 0,
+    PreCache = 1,
+    PostCache = 2,
+}
+
+impl From<i32> for Phase {
+    fn from(n: i32) -> Phase {
+        match n {
+            1 => Phase::PreCache,
+            2 => Phase::PostCache,
+            _ => Phase::Invalid,
+        }
+    }
+}
+
+/// Convert host call `Result` into the encoded result (`i32`).
+pub fn from_result(res: Result) -> i32 {
+    match res {
+        Ok(v) => v,
+        Err(e) => e.into(),
     }
 }

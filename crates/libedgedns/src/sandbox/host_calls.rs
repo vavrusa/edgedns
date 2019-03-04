@@ -17,7 +17,7 @@ pub fn import_objects() -> ImportObject {
         "env" => {
             "debug" => debug<[u32, u32] -> []>,
             "register_future" => register_future<[i32, i32] -> [i32]>,
-            "register_on_message" => register_on_message<[i32, i32] -> []>,
+            "register_on_message" => register_on_message<[i32, i32, i32] -> [i32]>,
             "timer_poll" => timer_poll<[i32] -> [i32]>,
             "timer_create" => timer_create<[i32] -> [i32]>,
             "forward_create" => forward_create<[i32, i32, i32, i32, i32] -> [i32]>,
@@ -73,14 +73,23 @@ extern "C" fn register_future(data: i32, vtable_ptr: i32, ctx: &mut Ctx) -> i32 
     }
 }
 
-extern "C" fn register_on_message(data: i32, vtable_ptr: i32, ctx: &mut Ctx) {
+extern "C" fn register_on_message(phase: i32, data: i32, vtable_ptr: i32, ctx: &mut Ctx) -> i32 {
     let instance = from_context(ctx);
+
+    let phase = guest::Phase::from(phase);
+    if phase == guest::Phase::Invalid {
+        return guest::Error::InvalidInput.into();
+    }
 
     // The callbacks are currently passed as fat pointers for `FnMut`,
     // this automatically expands to two pointers: data and vtable pointer.
-    *instance.callback_message.write() = GuestCallback {
-        ptr: (data, vtable_ptr),
-    };
+    instance.callback_message.write().insert(
+        phase,
+        GuestCallback {
+            ptr: (data, vtable_ptr),
+        },
+    );
+    return guest::Error::Ok.into();
 }
 
 extern "C" fn timer_poll(task_id: i32, ctx: &mut Ctx) -> i32 {

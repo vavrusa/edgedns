@@ -3,28 +3,22 @@ use bytes::{Bytes, BytesMut};
 use core::ffi::c_void;
 use futures::future::Shared;
 use futures::sync::oneshot::{channel, Receiver, Sender};
-use guest;
 use log::*;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use slab::Slab;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio::prelude::*;
+use guest;
 
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
 mod host_calls;
 mod loader;
 pub use loader::FSLoader;
-
-/// TODO: docstring
-#[derive(Debug)]
-pub enum Phase {
-    PreCache,
-    PostCache,
-}
 
 #[derive(Debug)]
 pub enum CallError {
@@ -46,7 +40,7 @@ pub struct InstanceWrapper {
     /// list of future ID to run
     scheduled_queue: Mutex<Vec<usize>>,
     /// function to call on each message
-    callback_message: RwLock<GuestCallback>,
+    callback_message: RwLock<HashMap<guest::Phase, GuestCallback>>,
     /// channel to cancel all the futures spawned by the instance
     cancel: (Mutex<Option<Sender<()>>>, Shared<Receiver<()>>),
 }
@@ -90,7 +84,7 @@ pub fn instantiate(name: String, data: &[u8], context: Arc<Context>) -> error::R
             scheduled_queue: Mutex::new(Vec::new()),
             guest_futures: RwLock::new(Slab::new()),
             request_states: RwLock::new(Slab::new()),
-            callback_message: RwLock::new(GuestCallback::default()),
+            callback_message: RwLock::new(HashMap::new()),
             cancel: {
                 let (s, r) = channel();
                 (Mutex::new(Some(s)), r.shared())
@@ -122,11 +116,16 @@ pub fn run(instance: &Instance) -> impl Future<Item = (), Error = CallError> {
 /// Run instance registered hook.
 pub fn run_hook(
     instance: &Instance,
+    phase: guest::Phase,
     scope: &Scope,
     answer: BytesMut,
 ) -> impl Future<Item = (BytesMut, guest::Action), Error = CallError> {
     // Check if callback is installed
-    let cb = instance.callback_message.read();
+    let callbacks = instance.callback_message.read();
+    let cb = match callbacks.get(&phase) {
+        Some(cb) => cb,
+        None => return future::Either::A(future::ok((answer, guest::Action::Pass))),
+    };
 
     // Register request state
     let req = GuestFuture::new(instance.clone()).with_request(scope, answer.clone());

@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use clap::{App, Arg};
 use domain_core::bits::*;
 use env_logger;
+use guest;
 use libedgedns::{sandbox, Config, Context, FramedStream, Scope};
 use log::*;
 use std::net::SocketAddr;
@@ -82,8 +83,8 @@ fn main() {
                     };
 
                     // Process message
-                    let (action, answer) =
-                        await!(loader.run_hook(sandbox::Phase::PreCache, &scope, answer));
+                    let (answer, action) =
+                        await!(loader.run_hook(guest::Phase::PreCache, &scope, answer));
                     trace!("processed hook: {:?}", action);
 
                     sink = await!(sink.send((answer.into(), from))).unwrap();

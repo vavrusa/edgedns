@@ -5,14 +5,14 @@ use crate::context::Context;
 use crate::error::Result;
 use crate::forwarder::Forwarder;
 use crate::recursor::Recursor;
-use crate::sandbox::{FSLoader, Phase};
+use crate::sandbox::FSLoader;
 use crate::tracing;
 use crate::varz;
 use bytes::{Bytes, BytesMut};
 use domain_core::bits::*;
 use domain_core::iana::{Class, Rcode, Rtype};
 use domain_core::rdata::{AllRecordData, Txt};
-use guest::Action;
+use guest::{Action, Phase};
 use lazy_static::*;
 use log::*;
 use std::io::ErrorKind;
@@ -207,7 +207,7 @@ impl QueryRouter {
         }
 
         // Process pre-flight phase
-        let (action, answer) = await!(self.sandbox.run_phase(Phase::PreCache, &scope, answer));
+        let (answer, action) = await!(self.sandbox.run_phase(Phase::PreCache, &scope, answer));
         match action {
             Action::Deliver => return Ok(answer),
             Action::Drop => return resolve_to_error(&scope, answer, Rcode::Refused, false),

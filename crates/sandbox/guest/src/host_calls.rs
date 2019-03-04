@@ -2,7 +2,7 @@
 extern "C" {
     // General purpose hostcalls
     pub fn register_future(closure: *mut FnMut() -> i32) -> i32;
-    pub fn register_on_message(closure: *mut FnMut(i32) -> i32);
+    pub fn register_on_message(phase: i32, closure: *mut FnMut(i32) -> i32) -> i32;
     pub fn debug(ptr: i32, len: i32);
 
     // Provided I/O operations

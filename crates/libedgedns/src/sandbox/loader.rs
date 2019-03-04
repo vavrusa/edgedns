@@ -3,9 +3,9 @@
 use crate::context::Context;
 use crate::error::Error;
 use crate::query_router::Scope;
-use crate::sandbox::{instantiate, Instance, Phase};
+use crate::sandbox::{instantiate, Instance};
 use bytes::BytesMut;
-use guest::Action;
+use guest;
 use log::*;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -99,15 +99,20 @@ impl FSLoader {
 
     pub async fn run_phase<'a>(
         &'a self,
-        phase: Phase,
+        phase: guest::Phase,
         scope: &'a Scope,
         answer: BytesMut,
-    ) -> (Action, BytesMut) {
+    ) -> (BytesMut, guest::Action) {
         let loaded = self.loaded.read();
         for (name, instance) in loaded.iter() {
             // TODO: implement multi phase hook in sandbox
+            debug!("run phase {}:{:?}", name, phase);
+            // let instance = instance.0;
+            // let result = await!(super::run_hook(&instance, hook, scope, answer));
+            // TODO: declare action type(terminate/non-terminate)
+            //if action == guest::Action::
         }
-        (Action::Pass, answer)
+        (answer, guest::Action::Pass)
     }
 
     fn reload_dir(

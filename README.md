@@ -31,6 +31,11 @@ cargo install
 1. Edit a copy of the [`edgedns.toml`](https://github.com/jedisct1/edgedns/blob/0.3.0/edgedns.toml) configuration file
 2. Run `edgedns -c /path/to/edgedns.toml`
 
+For development, you can use systemfd for socket activation on code change:
+
+1. cargo install cargo-watch systemfd
+2. systemfd --no-pid -s tcp::1053 -s udp::1053 -- cargo watch -x 'run --bin edgedns -- --config edgedns.toml'
+
 On Linux, you may use that
 [sample systemd service](https://github.com/jedisct1/edgedns/blob/master/edgedns.service)
 to start it.

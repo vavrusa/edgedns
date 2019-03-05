@@ -36,14 +36,13 @@ listen = "0.0.0.0:53"
 
 # For example, an additional TLS interface would be configured as:
 #
-# [network.listen.dns]
+# [[network.listen]]
 # address = "0.0.0.0:53"
 # internal = true
 #
-# [network.listen.dot]
+# [[network.listen]]
 # address = "0.0.0.0:853"
 # tls = ["cert.p1", "password"]
-listen = "0.0.0.0:53"
 
 [webservice]
 # Change to `true` in order to start the webservice

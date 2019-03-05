@@ -1,7 +1,7 @@
 use crate::codecs::*;
 use crate::config::Listener;
 use crate::context::Context;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::query_router::{QueryRouter, Scope};
 use bytes::{Bytes, BytesMut};
 use futures::sync::mpsc;

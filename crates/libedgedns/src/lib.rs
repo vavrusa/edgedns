@@ -20,7 +20,7 @@ mod tracing;
 
 pub use crate::cache::*;
 pub use crate::conductor::Conductor;
-pub use crate::config::Config;
+pub use crate::config::{Config, Listener};
 pub use crate::context::*;
 pub use crate::query_router::*;
 pub use crate::server::*;

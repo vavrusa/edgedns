@@ -8,7 +8,6 @@ use crate::forwarder::LoadBalancingMode;
 use http::Uri;
 use log::*;
 use native_tls::{Identity, TlsAcceptor};
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::prelude::*;
@@ -48,14 +47,22 @@ impl FromStr for ServerType {
 }
 
 /// Configuration for a local listener.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Listener {
-    pub address: Option<SocketAddr>,
+    pub address: SocketAddr,
     pub tls: Option<TlsAcceptor>,
     pub internal: bool
 }
 
 impl Listener {
+    pub fn new(address: SocketAddr) -> Self {
+        Self {
+            address,
+            tls: None,
+            internal: false,
+        }
+    }
+
     fn set_tls(&mut self, config: &toml::Value) -> Result<()> {
         if let Some(tls) = config.get("tls") {
             // Only pkcs12 certificate is supported currently
@@ -91,11 +98,7 @@ impl TryFrom<&str> for Listener {
     type Error = Error;
     fn try_from(x: &str) -> Result<Listener> {
         let address = x.parse::<SocketAddr>()?;
-        Ok(Listener {
-            address: Some(address),
-            tls: None,
-            internal: false,
-        })
+        Ok(Listener::new(address))
     }
 }
 
@@ -107,7 +110,7 @@ pub struct Config {
     pub lbmode: LoadBalancingMode,
     pub upstream_max_failure_duration: Duration,
     pub cache_size: usize,
-    pub listen: HashMap<String, Arc<Listener>>,
+    pub listen: Vec<Arc<Listener>>,
     pub webservice_enabled: bool,
     pub webservice_listen_addr: String,
     pub min_ttl: u32,
@@ -130,11 +133,6 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let mut listen: HashMap<String, Arc<Listener>> = HashMap::new();
-        listen.insert(
-            "default".to_owned(),
-            Arc::new(Listener::try_from("0.0.0.0:53").unwrap()),
-        );
         Self {
             server_type: ServerType::default(),
             decrement_ttl: true,
@@ -142,7 +140,7 @@ impl Default for Config {
             lbmode: LoadBalancingMode::default(),
             upstream_max_failure_duration: Duration::from_millis(2500),
             cache_size: 250_000,
-            listen,
+            listen: vec![Arc::new(Listener::try_from("0.0.0.0:53").unwrap())],
             webservice_enabled: false,
             webservice_listen_addr: "0.0.0.0:9090".to_string(),
             min_ttl: 1,
@@ -217,6 +215,7 @@ impl Config {
                 x.as_str().expect("upstream.strategy must be a string")
             });
         let lbmode = match lbmode_str {
+            "fallback" => LoadBalancingMode::Fallback,
             "uniform" => LoadBalancingMode::Uniform,
             "consistent" => LoadBalancingMode::Consistent,
             "minload" => LoadBalancingMode::MinLoad,
@@ -258,26 +257,24 @@ impl Config {
 
         let listen = config_network
             .and_then(|x| x.get("listen"))
-            .map(move |x| {
-                let mut t = HashMap::new();
+            .map_or(vec![Arc::new(Listener::try_from("0.0.0.0:53").unwrap())], move |x| {
                 match x.as_str() {
                     Some(x) => {
                         // Insert single listener
-                        t.insert("default".to_owned(), Arc::new(Listener::try_from(x).unwrap()));
+                        vec![Arc::new(Listener::try_from(x).expect("network.listen must be an address or table"))]
                     }
                     None => {
                         // Collect multiple listeners
-                        for (name, opts) in x
-                            .as_table()
-                            .expect("network.listen must be a string or a table")
-                        {
-                            let mut listener = match opts.get("address") {
-                                Some(x) => Listener::try_from(
-                                    x.as_str().expect("network.listen.address must be a string"),
-                                )
-                                .expect("network.listen.address is a valid address"),
-                                None => Listener::default(),
-                            };
+                        x.as_array()
+                        .expect("network.listen must be an address or table")
+                        .iter()
+                        .map(|opts| {
+                            let mut listener = Listener::try_from(opts.get("address")
+                                .expect("network.listen.address is required")
+                                .as_str()
+                                .expect("network.listen.address must be a string")
+                            )
+                            .expect("network.listen.address is a valid address");
 
                             // Optional TLS configuration
                             listener
@@ -289,13 +286,12 @@ impl Config {
                                 x.as_bool().expect("network.listen.internal must be boolean")
                             });
 
-                            t.insert(name.clone(), Arc::new(listener));
-                        }
+                            Arc::new(listener)
+                        })
+                        .collect()
                     }
-                };
-                t
-            })
-            .expect("network.listen must be a set");
+                }
+            });
 
         let config_webservice = toml_config.get("webservice");
 

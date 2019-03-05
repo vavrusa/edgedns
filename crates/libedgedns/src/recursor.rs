@@ -180,7 +180,7 @@ impl Recursor {
         let conductor = context.conductor.clone();
         while state == kres::State::PRODUCE {
             state = match request.produce() {
-                Some((buf, addresses)) => {
+                Ok(Some((buf, addresses))) => {
                     // Save first address in case of an error
                     let first_address = addresses[0];
                     let msg = Message::from_bytes(buf).unwrap();
@@ -261,7 +261,8 @@ impl Recursor {
                         }
                     }
                 }
-                None => kres::State::DONE,
+                Ok(None) => kres::State::DONE,
+                Err(_) => kres::State::FAIL,
             };
 
             // Limit the maximum number of iterations

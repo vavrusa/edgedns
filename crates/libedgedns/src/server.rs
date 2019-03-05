@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use stream_cancel::{StreamExt, Tripwire};
 use tokio::await;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket, UnixListener};
 use tokio::prelude::*;
 use tokio::reactor::Handle;
 use tokio_tls::TlsAcceptor;
@@ -45,56 +45,13 @@ impl Server {
         }
     }
 
-    /// Process clients from a listener.
-    pub async fn listener_accept(
-        context: Arc<Context>,
-        router: Arc<QueryRouter>,
-        connections: Arc<EstablishedConnections>,
-        listener: TcpListener,
-        tls_acceptor: Option<tokio_tls::TlsAcceptor>,
-        local_endpoint: Arc<Listener>,
-        cancel: Tripwire,
-    ) {
-        let mut incoming = listener.incoming().take_until(cancel.clone());
-        while let Some(item) = await!(incoming.next()) {
-            // Check if the next client can be accepted
-            let stream = match item {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!("can't accept stream client, err {:?}", e);
-                    continue;
-                }
-            };
-
-            let peer_addr = stream.peer_addr().expect("tcp peer has address");
-            trace!("stream client {} connected", peer_addr);
-
-            // Perform the optional TLS handshake
-            let stream = match tls_acceptor {
-                Some(ref tls_acceptor) => match await!(tls_acceptor.clone().accept(stream)) {
-                    Ok(stream) => FramedStream::from(stream),
-                    Err(e) => {
-                        warn!("TLS handshake failed, err {:?}", e);
-                        continue;
-                    }
-                },
-                None => FramedStream::from(stream),
-            };
-
-            Self::stream_start_client(
-                &context,
-                router.clone(),
-                connections.clone(),
-                stream,
-                peer_addr,
-                local_endpoint.clone(),
-                cancel.clone(),
-            );
-        }
+    /// Returns client connections tracker.
+    pub fn connections(&self) -> Arc<EstablishedConnections> {
+        self.connections.clone()
     }
 
     /// Process stream sequentially (message by message).
-    async fn stream_process_sequential(
+    pub async fn stream_process_sequential(
         router: Arc<QueryRouter>,
         stream: FramedStream,
         local_endpoint: Arc<Listener>,
@@ -140,7 +97,7 @@ impl Server {
     }
 
     /// Process stream concuurrently (each message is resolved in parallel).
-    async fn stream_process_concurrent(
+    pub async fn stream_process_concurrent(
         router: Arc<QueryRouter>,
         stream: FramedStream,
         sender: mpsc::Sender<(Bytes, SocketAddr)>,
@@ -290,48 +247,25 @@ impl Server {
         );;
     }
 
-    /// Spawn listeners and stream processors from the configuration.
-    pub fn spawn(&self, query_router: Arc<QueryRouter>, cancel: Tripwire) -> Result<()> {
-        for (name, local_endpoint) in self.context.config.listen.iter() {
-            let addr = match local_endpoint.address {
-                Some(x) => x,
-                None => continue,
-            };
-
-            self.spawn_listener(addr, query_router.clone(), local_endpoint.clone(), cancel.clone())
-            .map_err(|e| Error::from(format!("failed to listen on {}: {}", addr, e)))?;
-
-            info!("listener '{}' bound to {}", name, addr);
-        }
-
-        Ok(())
-    }
-
     /// Spawn DNS listener and stream processors for given address on UDP and TCP.
-    pub fn spawn_listener(
+    pub fn spawn(
         &self,
-        addr: SocketAddr,
         router: Arc<QueryRouter>,
         local_endpoint: Arc<Listener>,
         cancel: Tripwire,
     ) -> Result<()> {
-        // Spawn TLS listener and stream processors for given address.
-        if let Some(ref tls) = local_endpoint.tls {
-            let acceptor = TlsAcceptor::from(tls.clone());
-            let socket = TcpListener::bind(&addr)?;
-            let connections = self.connections.clone();
-            tokio::spawn_async(Self::listener_accept(
-                self.context.clone(),
-                router.clone(),
-                connections,
-                socket,
-                Some(acceptor),
-                local_endpoint,
-                cancel.clone(),
-            ));
+        let addr = local_endpoint.address;
 
+        // Spawn TLS listener and stream processors for given address.
+        if local_endpoint.tls.is_some() {
+            let socket = TcpListener::bind(&addr)?;
+            self.spawn_stream_tcp(router.clone(), socket, local_endpoint, cancel);
             return Ok(());
         }
+
+        // Spawn TCP acceptors
+        let socket = TcpListener::bind(&addr)?;
+        self.spawn_stream_tcp(router.clone(), socket, local_endpoint.clone(), cancel.clone());
 
         // Spawn a single concurrent handler with higher overhead, and the rest of fast-lane handlers.
         // This serves two purposes:
@@ -340,39 +274,86 @@ impl Server {
         //  * The non-concurrent handler can process a single request at a time, but can clear more
         //    requests per second during heavy load.
         let socket = create_udp_socket(addr)?;
-        let stream = FramedStream::from(udp_socket_from(socket.try_clone()?)?);
-        let (tx, rx) = mpsc::channel(CONCURRENT_QUEUE_SIZE);
-        tokio::spawn_async(Self::stream_process_concurrent(
-            router.clone(),
-            stream,
-            tx,
-            rx,
-            local_endpoint.clone(),
-            cancel.clone(),
-        ));
+        let stream = udp_socket_from(socket.try_clone()?)?;
+        self.spawn_stream_udp(router.clone(), stream, local_endpoint.clone(), cancel.clone());
 
         let stream = FramedStream::from(udp_socket_from(socket)?);
         tokio::spawn_async(Self::stream_process_sequential(
-            router.clone(),
+            router,
             stream,
-            local_endpoint.clone(),
-            cancel.clone(),
-        ));
-
-        // Spawn TCP acceptors
-        let socket = TcpListener::bind(&addr)?;
-        let connections = self.connections.clone();
-        tokio::spawn_async(Self::listener_accept(
-            self.context.clone(),
-            router.clone(),
-            connections,
-            socket,
-            None,
             local_endpoint,
-            cancel.clone(),
+            cancel,
         ));
 
         Ok(())
+    }
+
+    /// Spawns a UDP processor on the server.
+    pub fn spawn_stream_udp(&self, query_router: Arc<QueryRouter>, stream: UdpSocket, local_endpoint: Arc<Listener>, cancel: Tripwire) {
+        let stream = FramedStream::from(stream);
+        let (tx, rx) = mpsc::channel(CONCURRENT_QUEUE_SIZE);
+        tokio::spawn_async(Self::stream_process_concurrent(
+            query_router,
+            stream,
+            tx,
+            rx,
+            local_endpoint,
+            cancel,
+        ));
+    }
+
+    /// Spawns a TCP listener on the server.
+    pub fn spawn_stream_tcp(&self, query_router: Arc<QueryRouter>, listener: TcpListener, local_endpoint: Arc<Listener>, cancel: Tripwire) {
+        let tls_acceptor = match local_endpoint.tls {
+            Some(ref tls) => Some(TlsAcceptor::from(tls.clone())),
+            None => None,
+        };
+
+        let context = self.context.clone();
+        let connections = self.connections.clone();
+        tokio::spawn_async(async move {
+            let mut incoming = listener.incoming().take_until(cancel.clone());
+            while let Some(item) = await!(incoming.next()) {
+                // Check if the next client can be accepted
+                let stream = match item {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!("can't accept stream client, err {:?}", e);
+                        continue;
+                    }
+                };
+
+                let peer_addr = stream.peer_addr().expect("tcp peer has address");
+                trace!("stream client {} connected", peer_addr);
+
+                // Perform the optional TLS handshake
+                let stream = match tls_acceptor {
+                    Some(ref tls_acceptor) => match await!(tls_acceptor.clone().accept(stream)) {
+                        Ok(stream) => FramedStream::from(stream),
+                        Err(e) => {
+                            warn!("TLS handshake failed, err {:?}", e);
+                            continue;
+                        }
+                    },
+                    None => FramedStream::from(stream),
+                };
+
+                Self::stream_start_client(
+                    &context,
+                    query_router.clone(),
+                    connections.clone(),
+                    stream,
+                    peer_addr,
+                    local_endpoint.clone(),
+                    cancel.clone(),
+                );
+            }
+        });
+    }
+
+    /// Spawns a UNIX listener on the server.
+    pub fn spawn_stream_unix(&self, _query_router: Arc<QueryRouter>, _listener: UnixListener, _local_endpoint: Arc<Listener>, _cancel: Tripwire) {
+        unimplemented!()
     }
 }
 

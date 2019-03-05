@@ -369,11 +369,13 @@ impl Builder {
         upstream_servers_str: &[String],
         lbmode: LoadBalancingMode,
     ) -> Self {
-        self.failover_mode = Some(lbmode);
-        self.upstream_servers = upstream_servers_str
-            .iter()
-            .map(|x| x.parse::<SocketAddr>().unwrap())
-            .collect();
+        if !upstream_servers_str.is_empty() {
+            self.failover_mode = Some(lbmode);
+            self.upstream_servers = upstream_servers_str
+                .iter()
+                .map(|x| x.parse::<SocketAddr>().unwrap())
+                .collect();
+        }
         self
     }
 

@@ -192,7 +192,7 @@ impl QueryRouter {
             // Internet class, fallthrough
             Class::In => {}
             // Other class, not implemented
-            _ => return resolve_to_error(&scope, answer, Rcode::NotImp, false),
+            _ => return self.resolve_to_error(&scope, answer, Rcode::NotImp, false),
         };
 
         // Process query
@@ -249,7 +249,7 @@ impl QueryRouter {
                     Err(e) => {
                         debug!("query router failed to resolve '{}': {:?}", cache_key, e);
                         varz.client_queries_errors.inc();
-                        resolve_to_error(&scope, answer, Rcode::ServFail, false)
+                        self.resolve_to_error(&scope, answer, Rcode::ServFail, false)
                     }
                 }
             }
@@ -336,7 +336,7 @@ impl QueryRouter {
                     source.len(),
                     max_bufsize
                 );
-                resolve_to_error(scope, answer, src_header.rcode(), true)
+                self.resolve_to_error(scope, answer, src_header.rcode(), true)
             }
         }
     }
@@ -357,7 +357,7 @@ impl QueryRouter {
     fn resolve_to_chaos(&self, scope: &Scope, answer: BytesMut) -> Result<BytesMut> {
         // Fallback handler only implements CH TXT
         if scope.question.qtype() != Rtype::Txt {
-            return resolve_to_error(scope, answer, Rcode::NotImp, false);
+            return self.resolve_to_error(scope, answer, Rcode::NotImp, false);
         }
 
         // Build message response header and question
@@ -398,28 +398,31 @@ impl QueryRouter {
 
         Ok(message.finish())
     }
-}
 
-/// Fallback handler to resolve errors into error responses
-fn resolve_to_error(
-    scope: &Scope,
-    answer: BytesMut,
-    rcode: Rcode,
-    truncated: bool,
-) -> Result<BytesMut> {
-    // TODO: reuse header and opt building code
-    let mut message = MessageBuilder::from_buf(answer);
-    let header = message.header_mut();
-    *header = *scope.query.header();
-    header.set_id(scope.query.header().id());
-    header.set_qr(true);
-    header.set_rcode(rcode);
-    header.set_tc(truncated);
-    if message.push(scope.question.clone()).is_err() {
-        return Err(ErrorKind::UnexpectedEof.into());
+    /// Fallback handler to resolve errors into error responses
+    fn resolve_to_error(
+        &self,
+        scope: &Scope,
+        answer: BytesMut,
+        rcode: Rcode,
+        truncated: bool,
+    ) -> Result<BytesMut> {
+        let server_type = self.context.config.server_type;
+        let mut message = MessageBuilder::from_buf(answer);
+        let header = message.header_mut();
+        *header = *scope.query.header();
+        header.set_id(scope.query.header().id());
+        header.set_qr(true);
+        header.set_ra(server_type == ServerType::Recursive);
+        header.set_rcode(rcode);
+        header.set_tc(truncated);
+        if message.push(scope.question.clone()).is_err() {
+            return Err(ErrorKind::UnexpectedEof.into());
+        }
+
+        Ok(message.finish())
     }
 
-    Ok(message.finish())
 }
 
 #[cfg(test)]

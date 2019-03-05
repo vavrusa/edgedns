@@ -34,8 +34,8 @@ use tokio_tls;
 const DNS_OVER_TLS_PORT: u16 = 853;
 /// Extra allowed time for each try to account for variability;
 const DEFAULT_EXCHANGE_EXTRA: Duration = Duration::from_millis(50);
-/// Default timeout for single message exchange
-pub const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Default retry interval for a single message exchange
+const DEFAULT_EXCHANGE_RETRY: Duration = Duration::from_millis(250);
 /// Default connection concurrency (number of outstanding requests for single connection)
 const DEFAULT_CONNECTION_CONCURRENCY: usize = 1000;
 /// Default number of tracked connections.
@@ -443,7 +443,7 @@ impl Exchanger for AnyExchanger {
     ) -> ExchangeFuture {
         let selection = origin.get_scoped(scope, &self.timetable);
         let tries = cmp::min(selection.len(), 2);
-        let default_expected_rtt = DEFAULT_EXCHANGE_TIMEOUT / tries as u32;
+        let default_expected_rtt = DEFAULT_EXCHANGE_RETRY;
         let mut retries = Retransmitter::new();
         for addr in selection.iter().cycle().take(tries) {
             // Estimate expected RTT + extra time to account for variability

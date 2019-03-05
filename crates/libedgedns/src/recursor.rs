@@ -1,5 +1,5 @@
 use crate::cache::{Cache, CacheKey};
-use crate::conductor::{Origin, Timetable, DEFAULT_EXCHANGE_TIMEOUT};
+use crate::conductor::{Origin, Timetable};
 use crate::config::Config;
 use crate::context::Context;
 use crate::forwarder::{Forwarder, LoadBalancingMode};
@@ -21,6 +21,8 @@ use tokio::await;
 use tokio::prelude::*;
 use tokio::timer::Interval;
 
+/// Default timeout for single upstream query
+const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// Maximum number of iterations spent for each query
 const MAX_ITERATIONS_PER_QUERY: usize = 200;
 

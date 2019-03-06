@@ -57,7 +57,7 @@ impl Sandbox {
             .instances
             .read()
             .values()
-            .map(|x| x.0.clone())
+            .map(|(x, _)| x.clone())
             .collect();
         trace!("resolving phase {:?}", phase);
         for instance in instances.iter() {
@@ -74,6 +74,15 @@ impl Sandbox {
         }
 
         (answer, action)
+    }
+}
+
+/// Cancel all running instances on close.
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        for (_, (instance, ..)) in self.instances.write().drain() {
+            instance.cancel();
+        }
     }
 }
 

@@ -1,8 +1,7 @@
 /// Apps loader that loads sandboxed apps from a local directory.
 use crate::context::Context;
 use crate::error::Error;
-use crate::sandbox::instantiate;
-use crate::sandbox::sandbox::InstanceMap;
+use crate::sandbox::{self, sandbox::InstanceMap};
 use log::*;
 use std::fs;
 use std::io;
@@ -69,21 +68,30 @@ impl FSLoader {
             }
 
             let time = std::fs::metadata(&path)?.modified()?;
+            let filename = filename.to_owned();
 
-            match instances.read().get(&String::from(filename)) {
+            match instances.read().get(&filename) {
                 Some(v) if v.1 == time => continue,
                 _ => (),
             }
 
+            // Instantiate the app
             trace!("reloading app '{}'", filename);
             let data = Self::read_to_end(PathBuf::from(&path))?;
-            let instance = instantiate(String::from(filename), &data, context.clone())
+            let instance = sandbox::instantiate(filename.clone(), &data, context.clone())
                 .map_err(|e| Error::from(format!("{:?}", e).as_str()))?;
-            if let Some(old_instance) = instances
-                .write()
-                .insert(String::from(filename), (instance, time))
-            {
-                old_instance.0.cancel();
+
+            // Start the entrypoint
+            tokio::spawn(sandbox::run(&instance).map_err(|e| {
+                if !e.is_cancellation() {
+                    error!("error while running the app: {:?}", e)
+                }
+            }));
+
+            // Replace the previous instance
+            let prev = instances.write().insert(filename, (instance, time));
+            if let Some((instance, ..)) = prev {
+                instance.cancel();
             }
         }
 
@@ -95,5 +103,44 @@ impl FSLoader {
         let mut file = std::fs::File::open(path)?;
         file.read_to_end(&mut buf)?;
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{FSLoader, InstanceMap};
+    use crate::test_utils::{test_context, test_root_path, TEST_APP};
+    use std::fs::File;
+    use std::io::prelude::*;
+    use toml;
+
+    #[test]
+    fn it_loads() {
+        // Write a test app file
+        let path = test_root_path();
+        File::create(path.join("test_app.wasm"))
+            .unwrap()
+            .write_all(TEST_APP)
+            .unwrap();
+
+        // Try to load it from disk
+        let context = test_context();
+        let config = {
+            let mut t = toml::value::Table::new();
+            t.insert(
+                "test_app".to_owned(),
+                toml::value::Value::Table(toml::value::Table::new()),
+            );
+            t
+        };
+
+        let instances = InstanceMap::default();
+        let loader = FSLoader::new(path, config);
+        tokio::run_async(
+            async move {
+                loader.load(&instances, &context).expect("loaded instance");
+                drop(loader);
+            },
+        );
     }
 }

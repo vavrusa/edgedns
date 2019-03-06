@@ -1,22 +1,18 @@
 [package]
-name = "proxy"
+name = "test-app"
 version = "0.1.0"
 authors = ["Marek Vavruša <mvavrusa@cloudflare.com>"]
 edition = "2018"
 publish = false
 
 [lib]
-name = "proxy"
+name = "test_app"
+path = "lib.rs"
 crate-type = ["cdylib"]
-
-[features]
-default = ["wee_alloc"]
 
 [dependencies]
 futures-preview = { version = "=0.3.0-alpha.12", default-features = false, features = ["nightly"]}
-embrio-async = {git = "https://github.com/Nemo157/embrio-rs", rev = "73853731f00b1babefe572fe8b339f188e1a17db"}
-wee_alloc = {version = "0.4", optional = true}
-guest = {path = "../../guest"}
+guest = {path = "../../../../sandbox/guest"}
 
 [profile.release]
 lto = true

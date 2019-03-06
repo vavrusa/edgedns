@@ -15,9 +15,14 @@ use std::time::Duration;
 use tokio::codec::BytesCodec;
 use tokio::net::{TcpListener, UdpFramed, UdpSocket};
 use tokio::prelude::*;
+use std::env;
+use std::path::PathBuf;
 
 /// File with a list of test domains
 const DOMAINS_STR: &str = include_str!("domains.csv");
+
+/// Test sandbox apps
+pub const TEST_APP: &[u8] = include_bytes!("test_app/target/wasm32-unknown-unknown/release/test_app.wasm");
 
 // Static variables
 lazy_static! {
@@ -79,6 +84,25 @@ pub fn test_echo_server(timeout: Duration) -> (impl Future<Item = (), Error = ()
         });
 
     (echo_udp.join(echo_tcp).then(|_| Ok(())), local_addr)
+}
+
+/// Returns test root path.
+/// See https://github.com/rust-lang/cargo/issues/3368
+pub fn test_root_path() -> PathBuf {
+     let mut path = env::current_exe().unwrap();
+     path.pop(); // chop off exe name
+     path.pop(); // chop off 'debug'
+
+     // If `cargo test` is run manually then our path looks like
+     // `target/debug/foo`, in which case our `path` is already pointing at
+     // `target`. If, however, `cargo test --target $target` is used then the
+     // output is `target/$target/debug/foo`, so our path is pointing at
+     // `target/$target`. Here we conditionally pop the `$target` name.
+     if path.file_name().and_then(|s| s.to_str()) != Some("target") {
+         path.pop();
+     }
+
+     path
 }
 
 /// Test origin returning a predefined address

@@ -3,6 +3,7 @@ use bytes::{Bytes, BytesMut};
 use core::ffi::c_void;
 use futures::future::Shared;
 use futures::sync::oneshot::{channel, Receiver, Sender};
+use guest;
 use log::*;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use slab::Slab;
@@ -12,19 +13,28 @@ use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio::prelude::*;
-use guest;
 
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
+mod fsloader;
 mod host_calls;
 mod sandbox;
-mod fsloader;
 pub use sandbox::Sandbox;
 
 #[derive(Debug)]
 pub enum CallError {
     IO(Error),
     VM(Box<error::CallError>),
+}
+
+impl CallError {
+    /// Returns true if the error is a cancellation.
+    pub fn is_cancellation(&self) -> bool {
+        match self {
+            CallError::IO(e) => e.kind() == ErrorKind::Interrupted,
+            _ => false,
+        }
+    }
 }
 
 /// Wrapper for `wasmer_runtime::Instance`, to implement traits and
@@ -171,7 +181,7 @@ impl InstanceWrapper {
     }
 
     pub fn cancel(&self) {
-        *self.cancel.0.lock() = None;
+        drop(self.cancel.0.lock().take());
     }
 
     fn create_task(&self) -> usize {
@@ -275,16 +285,7 @@ impl Stream for GuestStream {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match self.cancel.poll() {
-            Ok(p) => {
-                if p.is_ready() {
-                    return Err(Error::new(ErrorKind::Other, "future canceled"));
-                }
-            }
-            Err(_) => {
-                return Err(Error::new(ErrorKind::Other, "future canceled"));
-            }
-        }
+        try_poll_cancel(&mut self.cancel)?;
 
         match self.instance.get_tasks_mut().get_mut(self.task_handle) {
             Some(GuestFutureState {
@@ -430,16 +431,7 @@ impl Future for GuestFuture {
     type Error = std::io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.cancel.poll() {
-            Ok(p) => {
-                if p.is_ready() {
-                    return Err(Error::new(ErrorKind::Other, "future canceled"));
-                }
-            }
-            Err(_) => {
-                return Err(Error::new(ErrorKind::Other, "future canceled"));
-            }
-        }
+        try_poll_cancel(&mut self.cancel)?;
 
         // Get next task callback from the queue
         let task_handle = match self.task_queue.front() {
@@ -505,4 +497,19 @@ impl Future for GuestFuture {
             }
         }
     }
+}
+
+/// Polls the cancellation signal.
+fn try_poll_cancel(cancel: &mut Shared<Receiver<()>>) -> Result<(), Error> {
+    match cancel.poll() {
+        Ok(p) => {
+            if p.is_ready() {
+                return Err(Error::new(ErrorKind::Interrupted, "future canceled"));
+            }
+        }
+        Err(_) => {
+            return Err(Error::new(ErrorKind::Interrupted, "future canceled"));
+        }
+    }
+    Ok(())
 }

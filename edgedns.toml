@@ -108,12 +108,9 @@ only_failures = false
 [apps]
 # Global settings for sandbox apps and the loader.
 
-# The location where apps should be loaded.
+# The location (local path) where apps should be loaded.
+# It will look for WASM files that are configured below.
 #location = "/etc/edgedns/apps"
-
-# Interval in second to check for reload. When left empty, no reload
-# will be scheduled.
-#reload_interval_sec = 60
 
 # Enabled app and its configuration.
 #[apps.example]

@@ -14,8 +14,8 @@ use std::io::prelude::*;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 use toml;
 
 /// EdgeDNS server type definition.
@@ -51,7 +51,7 @@ impl FromStr for ServerType {
 pub struct Listener {
     pub address: SocketAddr,
     pub tls: Option<TlsAcceptor>,
-    pub internal: bool
+    pub internal: bool,
 }
 
 impl Listener {
@@ -129,9 +129,8 @@ pub struct Config {
     pub tracing_reporter_url: Option<Uri>,
     pub tracing_sampling_rate: f64,
     pub tracing_only_failures: bool,
-    pub apps_location: Option<String>,
-    pub apps_reload_interval: Option<Duration>,
-    pub apps_config: Option<toml::value::Table>,
+    pub apps_location: Option<Uri>,
+    pub apps_config: toml::value::Table,
 }
 
 impl Default for Config {
@@ -163,8 +162,7 @@ impl Default for Config {
             tracing_sampling_rate: 0.01,
             tracing_only_failures: false,
             apps_location: None,
-            apps_reload_interval: None,
-            apps_config: None,
+            apps_config: toml::value::Table::new(),
         }
     }
 }
@@ -261,43 +259,49 @@ impl Config {
 
         let config_network = toml_config.get("network");
 
-        let listen = config_network
-            .and_then(|x| x.get("listen"))
-            .map_or(vec![Arc::new(Listener::try_from("0.0.0.0:53").unwrap())], move |x| {
+        let listen = config_network.and_then(|x| x.get("listen")).map_or(
+            vec![Arc::new(Listener::try_from("0.0.0.0:53").unwrap())],
+            move |x| {
                 match x.as_str() {
                     Some(x) => {
                         // Insert single listener
-                        vec![Arc::new(Listener::try_from(x).expect("network.listen must be an address or table"))]
+                        vec![Arc::new(
+                            Listener::try_from(x)
+                                .expect("network.listen must be an address or table"),
+                        )]
                     }
                     None => {
                         // Collect multiple listeners
                         x.as_array()
-                        .expect("network.listen must be an address or table")
-                        .iter()
-                        .map(|opts| {
-                            let mut listener = Listener::try_from(opts.get("address")
-                                .expect("network.listen.address is required")
-                                .as_str()
-                                .expect("network.listen.address must be a string")
-                            )
-                            .expect("network.listen.address is a valid address");
+                            .expect("network.listen must be an address or table")
+                            .iter()
+                            .map(|opts| {
+                                let mut listener = Listener::try_from(
+                                    opts.get("address")
+                                        .expect("network.listen.address is required")
+                                        .as_str()
+                                        .expect("network.listen.address must be a string"),
+                                )
+                                .expect("network.listen.address is a valid address");
 
-                            // Optional TLS configuration
-                            listener
-                                .set_tls(opts)
-                                .expect("network.listen.tls configuration");
+                                // Optional TLS configuration
+                                listener
+                                    .set_tls(opts)
+                                    .expect("network.listen.tls configuration");
 
-                            // Marking for internal interfaces
-                            listener.internal = opts.get("internal").map_or(false, |x| {
-                                x.as_bool().expect("network.listen.internal must be boolean")
-                            });
+                                // Marking for internal interfaces
+                                listener.internal = opts.get("internal").map_or(false, |x| {
+                                    x.as_bool()
+                                        .expect("network.listen.internal must be boolean")
+                                });
 
-                            Arc::new(listener)
-                        })
-                        .collect()
+                                Arc::new(listener)
+                            })
+                            .collect()
                     }
                 }
-            });
+            },
+        );
 
         let config_webservice = toml_config.get("webservice");
 
@@ -416,19 +420,9 @@ impl Config {
 
         let config_apps = toml_config.get("apps");
         let apps_location = config_apps.and_then(|x| x.get("location")).map(|x| {
-            let s = x.as_str().expect("apps.location must be a string");
-            String::from(s)
+            let uri = x.as_str().expect("apps.location must be a string");
+            Uri::from_str(uri).expect("apps.location must be a valid URI")
         });
-        let apps_reload_interval =
-            config_apps
-                .and_then(|x| x.get("reload_interval_sec"))
-                .map(|x| {
-                    Duration::from_secs(
-                        x.as_integer()
-                            .expect("apps.reload_interval_sec must be a number")
-                            as u64,
-                    )
-                });
 
         let apps_config = match config_apps {
             Some(config) => {
@@ -440,13 +434,9 @@ impl Config {
                         }
                     }
                 }
-                if t.len() > 0 {
-                    Some(t)
-                } else {
-                    None
-                }
+                t
             }
-            None => None,
+            None => toml::value::Table::new(),
         };
 
         Ok(Config {
@@ -476,7 +466,6 @@ impl Config {
             tracing_sampling_rate,
             tracing_only_failures,
             apps_location,
-            apps_reload_interval,
             apps_config,
         })
     }

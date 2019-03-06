@@ -22,7 +22,7 @@ lazy_static = "*"
 log = "*"
 coarsetime = "*"
 rand = "^0.6"
-toml = "*"
+toml = "0.4"
 bytes = "*"
 stream-cancel = "0.4"
 jumphash = {git = "https://github.com/jedisct1/rust-jumphash"}

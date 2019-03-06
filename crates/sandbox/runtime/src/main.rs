@@ -1,20 +1,22 @@
 #![feature(await_macro, async_await, futures_api)]
 
+use toml;
 use bytes::BytesMut;
 use clap::{App, Arg};
 use domain_core::bits::*;
 use env_logger;
 use guest;
-use libedgedns::{sandbox, Config, Context, FramedStream, Scope};
+use libedgedns::{Config, Context, FramedStream, Scope, sandbox::Sandbox};
 use log::*;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use http::Uri;
 use stream_cancel::Tripwire;
 use tokio::await;
 use tokio::net::UdpSocket;
 use tokio::prelude::*;
+use std::str::FromStr;
 
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const PKG_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
@@ -58,8 +60,8 @@ fn main() {
     tokio::run_async(
         async move {
             // Start the module loader
-            let loader = Arc::new(sandbox::FSLoader::new(context.clone()));
-            sandbox::FSLoader::spawn(loader.clone(), tripwire.clone());
+            let sandbox = Sandbox::from(&context.config);
+            sandbox.start(context.clone(), tripwire.clone());
 
             // Listen and process incoming messages
             if let Some(address) = matches.value_of("listen") {
@@ -84,8 +86,8 @@ fn main() {
 
                     // Process message
                     let (answer, action) =
-                        await!(loader.run_hook(guest::Phase::PreCache, &scope, answer));
-                    trace!("processed hook: {:?}", action);
+                        await!(sandbox.resolve(guest::Phase::PreCache, &scope, answer));
+                    trace!("processed phase: {:?}", action);
 
                     sink = await!(sink.send((answer.into(), from))).unwrap();
                 }
@@ -98,7 +100,7 @@ fn main() {
 
 fn runtime_context(path: &Path, name: &str) -> Arc<Context> {
     let mut config = Config::default();
-    config.apps_location = Some(path.to_str().unwrap().to_owned());
-    config.apps_reload_interval = Some(Duration::from_millis(500));
+    config.apps_location = Uri::from_str(path.to_str().unwrap()).ok();
+    config.apps_config.insert(name.to_owned(), toml::value::Value::Table(toml::value::Table::new()));
     Context::new(config)
 }

@@ -14,8 +14,10 @@ log = "*"
 clap = "2.32"
 env_logger = "^0.6"
 bytes = "0.4"
+toml = "0.4"
 tokio = {version = "0.1.15", features=["async-await-preview"]}
 domain-core = {git = "https://github.com/vavrusa/domain-core", rev = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}
 stream-cancel = "0.4"
 guest = {path = "../guest", default-features = false}
 libedgedns = {path = "../../libedgedns"}
+http = "0.1"

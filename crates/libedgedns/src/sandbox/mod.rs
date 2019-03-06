@@ -17,8 +17,9 @@ use guest;
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
 mod host_calls;
-mod loader;
-pub use loader::FSLoader;
+mod sandbox;
+mod fsloader;
+pub use sandbox::Sandbox;
 
 #[derive(Debug)]
 pub enum CallError {

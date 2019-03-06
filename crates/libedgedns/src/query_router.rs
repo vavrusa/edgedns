@@ -5,7 +5,7 @@ use crate::context::Context;
 use crate::error::Result;
 use crate::forwarder::Forwarder;
 use crate::recursor::Recursor;
-use crate::sandbox::FSLoader;
+use crate::sandbox::Sandbox;
 use crate::tracing;
 use crate::varz;
 use bytes::{Bytes, BytesMut};
@@ -137,12 +137,12 @@ enum QueryRouterVariant {
 pub struct QueryRouter {
     context: Arc<Context>,
     router: QueryRouterVariant,
-    sandbox: Arc<FSLoader>,
+    sandbox: Arc<Sandbox>,
     tracer: Arc<tracing::Tracer>,
 }
 
 impl QueryRouter {
-    pub fn new(context: Arc<Context>, sandbox: Arc<FSLoader>) -> Self {
+    pub fn new(context: Arc<Context>) -> Self {
         let config = &context.config;
         let tracer = Arc::new(tracing::Tracer::from_config(config));
         Self {
@@ -153,9 +153,15 @@ impl QueryRouter {
                 }
             },
             context,
-            sandbox,
+            sandbox: Arc::new(Sandbox::default()),
             tracer,
         }
+    }
+
+    /// Configures query router to use given app sandbox.
+    pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = Arc::new(sandbox);
+        self
     }
 
     /// Spawns the query router start in the default executor.
@@ -207,10 +213,10 @@ impl QueryRouter {
         }
 
         // Process pre-flight phase
-        let (answer, action) = await!(self.sandbox.run_phase(Phase::PreCache, &scope, answer));
+        let (answer, action) = await!(self.sandbox.resolve(Phase::PreCache, &scope, answer));
         match action {
             Action::Deliver => return Ok(answer),
-            Action::Drop => return resolve_to_error(&scope, answer, Rcode::Refused, false),
+            Action::Drop => return self.resolve_to_error(&scope, answer, Rcode::Refused, false),
             Action::Pass => {},
         }
 

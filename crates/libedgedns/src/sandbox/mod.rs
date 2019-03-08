@@ -1,7 +1,7 @@
 use crate::{Context, Scope};
 use bytes::{Bytes, BytesMut};
 use core::ffi::c_void;
-use futures::future::Shared;
+use futures::future::{Either, Shared};
 use futures::sync::oneshot::{channel, Receiver, Sender};
 use guest;
 use log::*;
@@ -111,17 +111,19 @@ pub fn instantiate(name: String, data: &[u8], context: Arc<Context>) -> error::R
 }
 
 /// Start an instance by calling the function `run`.
-pub fn run(instance: &Instance) -> impl Future<Item = (), Error = CallError> {
-    match instance.inner.lock().call("run", &[]) {
-        Ok(_) => future::Either::A({
-            let mut guest_tasks = instance.scheduled_queue.lock();
-            let guest_future = GuestFuture::new(instance.clone()).with_tasks(&*guest_tasks);
-            guest_tasks.clear();
-
-            guest_future.map(|_| ()).map_err(CallError::IO)
-        }),
-        Err(e) => future::Either::B(future::err(CallError::VM(e))),
-    }
+pub fn run(instance: Instance) -> impl Future<Item = (), Error = CallError> {
+    future::lazy(move || match instance.inner.lock().call("run", &[]) {
+        Ok(_) => {
+            let guest_tasks: Vec<_> = instance.scheduled_queue.lock().drain(..).collect();
+            if guest_tasks.is_empty() {
+                Either::B(future::ok(()))
+            } else {
+                let guest_future = GuestFuture::new(instance.clone()).with_tasks(&guest_tasks);
+                Either::A(guest_future.map(|_| ()).map_err(CallError::IO))
+            }
+        }
+        Err(e) => Either::B(future::err(CallError::VM(e))),
+    })
 }
 
 /// Run instance registered hook.
@@ -135,7 +137,7 @@ pub fn run_hook(
     let callbacks = instance.callback_message.read();
     let cb = match callbacks.get(&phase) {
         Some(cb) => cb,
-        None => return future::Either::A(future::ok((answer, guest::Action::Pass))),
+        None => return Either::A(future::ok((answer, guest::Action::Pass))),
     };
 
     // Register request state
@@ -148,14 +150,14 @@ pub fn run_hook(
             if let Some(Value::I32(res)) = values.first() {
                 if let guest::Async::Ready(action) = guest::Async::from(*res) {
                     instance.scheduled_queue.lock().pop();
-                    return future::Either::A(future::ok((answer, action.into())));
+                    return Either::A(future::ok((answer, action.into())));
                 }
             };
 
             // The closure registered a future, if the guest registered multiple tasks,
             // they will be executed sequentially.
             match instance.scheduled_queue.lock().pop() {
-                Some(task_handle) => future::Either::B({
+                Some(task_handle) => Either::B({
                     req.with_tasks(&[task_handle]).then(move |res| match res {
                         Ok((action, request)) => {
                             let answer = request.expect("request state").1;
@@ -165,13 +167,13 @@ pub fn run_hook(
                     })
                 }),
                 // Closure did not register a future, something must be wrong
-                None => future::Either::A(future::err(CallError::IO(Error::new(
+                None => Either::A(future::err(CallError::IO(Error::new(
                     ErrorKind::InvalidInput,
                     "closure does not return a future",
                 )))),
             }
         }
-        Err(message) => future::Either::A(future::err(message)),
+        Err(message) => Either::A(future::err(message)),
     }
 }
 

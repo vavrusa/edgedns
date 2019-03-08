@@ -81,18 +81,18 @@ impl FSLoader {
             let instance = sandbox::instantiate(filename.clone(), &data, context.clone())
                 .map_err(|e| Error::from(format!("{:?}", e).as_str()))?;
 
+            // Replace the previous instance
+            let prev = instances.write().insert(filename, (instance.clone(), time));
+            if let Some((instance, ..)) = prev {
+                instance.cancel();
+            }
+
             // Start the entrypoint
-            tokio::spawn(sandbox::run(&instance).map_err(|e| {
+            tokio::spawn(sandbox::run(instance).map_err(|e| {
                 if !e.is_cancellation() {
                     error!("error while running the app: {:?}", e)
                 }
             }));
-
-            // Replace the previous instance
-            let prev = instances.write().insert(filename, (instance, time));
-            if let Some((instance, ..)) = prev {
-                instance.cancel();
-            }
         }
 
         Ok(())

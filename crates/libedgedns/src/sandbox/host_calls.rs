@@ -1,16 +1,19 @@
-use super::{from_context, GuestCallback, GuestStream};
+use super::{from_context, GuestCallback, HostFuture};
 use crate::{forwarder, Scope};
+use bytes::{BufMut, BytesMut};
 use guest;
 use log::*;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::codec::*;
 use tokio::net::UnixStream;
 use tokio::prelude::*;
 use tokio::timer::Delay;
 
 use wasmer_runtime::{imports, Ctx, ImportObject};
+
+const STREAM_BUF_CAPACITY: usize = 8 * 1024;
 
 pub fn import_objects() -> ImportObject {
     imports! {
@@ -25,6 +28,7 @@ pub fn import_objects() -> ImportObject {
             "request_query_name" => request_query_name<[i32, i32, i32] -> [i32]>,
             "request_query_type" => request_query_type<[i32] -> [i32]>,
             "request_set_response" => request_set_response<[i32, i32, i32] -> [i32]>,
+            "request_local_addr" => request_local_addr<[i32, i32, i32] -> [i32]>,
             "local_socket_open" => local_socket_open<[i32, i32] -> [i32]>,
             "local_socket_send" => local_socket_send<[i32, i32, i32] -> [i32]>,
             "local_socket_recv" => local_socket_recv<[i32, i32, i32] -> [i32]>,
@@ -49,7 +53,7 @@ extern "C" fn register_future(data: i32, vtable_ptr: i32, ctx: &mut Ctx) -> i32 
     match instance.get_tasks_mut().get_mut(task_id as usize) {
         Some(ref mut fut) => {
             trace!(
-                "[{}] registered #{} callback: {}/{}",
+                "[{}] callback #{} created {}/{}",
                 instance,
                 task_id,
                 data,
@@ -94,22 +98,36 @@ extern "C" fn register_on_message(phase: i32, data: i32, vtable_ptr: i32, ctx: &
 
 extern "C" fn timer_poll(task_id: i32, ctx: &mut Ctx) -> i32 {
     let instance = from_context(ctx);
-    match instance.get_tasks().get(task_id as usize) {
-        Some(fut) => {
+    let res = match instance.get_tasks_mut().get_mut(task_id as usize) {
+        Some(ref mut task) => {
             // Check if the task is complete
-            if fut.data.is_none() {
-                return guest::Async::NotReady.into();
+            match task.host_future {
+                HostFuture::Delay(ref mut delay) => match delay.poll() {
+                    Ok(Async::Ready(_)) => {
+                        trace!("[{}] delay #{} fired", instance, task_id);
+                        guest::Async::Ready(0.into())
+                    }
+                    Ok(Async::NotReady) => guest::Async::NotReady,
+                    Err(e) => {
+                        warn!("[{}] delay #{} error: {:?}", instance, task_id, e);
+                        guest::Async::Error(guest::Error::Other(e.to_string()))
+                    }
+                },
+                _ => guest::Async::Error(guest::Error::InvalidInput),
             }
         }
         None => {
-            warn!("[{}] polled #{} which does not exist", instance, task_id);
-            return guest::Async::Error(guest::Error::NotFound).into();
+            warn!("[{}] delay #{} which does not exist", instance, task_id);
+            guest::Async::Error(guest::Error::NotFound)
         }
-    }
+    };
 
     // Complete the task
-    drop(instance.remove_task(task_id as usize));
-    guest::Async::Ready(0.into()).into()
+    if res.is_ready() {
+        drop(instance.remove_task(task_id as usize));
+    }
+
+    res.into()
 }
 
 extern "C" fn timer_create(ms: i32, ctx: &mut Ctx) -> i32 {
@@ -122,29 +140,14 @@ extern "C" fn timer_create(ms: i32, ctx: &mut Ctx) -> i32 {
     let task_id = instance.create_task();
 
     // Spawn the future and notify when done
-    let task = task::current();
     let when = Instant::now() + Duration::from_millis(ms as u64);
-    tokio::spawn(Delay::new(when).then(move |res| {
-        match res {
-            Ok(_) => {
-                trace!("[{}] timer fired for #{}", instance, task_id);
-                if let Some(ref mut task) = instance.get_tasks_mut().get_mut(task_id) {
-                    task.data = Some(Vec::new());
-                }
-            }
-            Err(e) => {
-                error!(
-                    "[{}] timer error for #{}, error: {:?}",
-                    instance, task_id, e
-                );
-                drop(instance.remove_task(task_id));
-            }
-        };
-        task.notify();
-        Ok(())
-    }));
-
-    guest::from_result(Ok(task_id as i32))
+    if let Some(ref mut task) = instance.get_tasks_mut().get_mut(task_id) {
+        trace!("[{}] delay #{} started", instance, task_id);
+        task.host_future = HostFuture::Delay(Delay::new(when));
+        guest::from_result(Ok(task_id as i32))
+    } else {
+        guest::Error::Unknown.into()
+    }
 }
 
 fn parse_addr_from_slice(addr_bytes: &[u8]) -> Result<SocketAddr, guest::Error> {
@@ -164,7 +167,6 @@ extern "C" fn forward_create(
     let instance = from_context(ctx);
 
     // Parse the upstream address from guest first, it's passed as a pointer to guest memory.
-    //let upstream = match state.inspect_memory(upstream_ptr as usize, upstream_len as usize) {
     let memory = ctx.memory(0);
     let slice = &memory[upstream_ptr as usize..(upstream_ptr + upstream_len) as usize];
     let upstream = match parse_addr_from_slice(&slice) {
@@ -183,7 +185,6 @@ extern "C" fn forward_create(
     } else {
         // Forward message from guest memory
         let msg = &memory[msg_ptr as usize..(msg_ptr + msg_len) as usize];
-
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let local_scope = Scope::new(msg.into(), local_addr).expect("scope");
         (msg.into(), local_scope)
@@ -191,90 +192,61 @@ extern "C" fn forward_create(
 
     // Create a new guest task for the forwarding
     let task_id = instance.create_task();
-    trace!(
-        "[{}] forwarding msg to {:?} ({} bytes)",
-        instance,
-        upstream,
-        msg.len()
-    );
+    trace!("[{}] forward to {:?} ({}B)", instance, upstream, msg.len());
 
-    // Spawn a new host task, and notify guest when the query is resolved
-    let waiting = task::current();
-    tokio::spawn(
-        forwarder::Builder::new()
+    // Spawn the future and notify when done
+    if let Some(ref mut task) = instance.get_tasks_mut().get_mut(task_id) {
+        let request = forwarder::Builder::new()
             .with_upstream_servers(vec![upstream])
             .build()
-            .resolve(&instance.context, &scope)
-            .then(move |res| {
-                match res {
-                    // Copy upstream response back to guest memory
-                    Ok(msg) => {
-                        trace!(
-                            "[{}] response for #{} ({} bytes)",
-                            instance,
-                            task_id,
-                            msg.len()
-                        );
-                        if let Some(ref mut task) = instance.get_tasks_mut().get_mut(task_id) {
-                            // TODO: keep a reference to guest memory to avoid double-copy
-                            task.data = Some(msg.to_vec())
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "[{}] when forwarding #{}, error: {:?}",
-                            instance, task_id, e
-                        );
-                        drop(instance.remove_task(task_id));
-                    }
-                };
-
-                // Reschedule waiting task
-                waiting.notify();
-                Ok(())
-            }),
-    );
-
-    guest::from_result(Ok(task_id as i32))
+            .resolve(&instance.context, &scope);
+        task.host_future = HostFuture::Resolve(Box::new(request));
+        guest::from_result(Ok(task_id as i32))
+    } else {
+        guest::Error::Unknown.into()
+    }
 }
 
 extern "C" fn forward_poll(task_id: i32, msg_ptr: i32, msg_max_len: i32, ctx: &mut Ctx) -> i32 {
     let instance = from_context(ctx);
 
-    // Check if the upstream provided a message
-    let msg_len = match instance.get_tasks().get(task_id as usize) {
-        Some(fut) => match fut.data {
-            Some(ref data) => data.len() as u16,
-            None => return guest::Async::NotReady.into(),
-        },
-        None => {
-            // No such task exists
-            warn!("[{}] polled #{} which does not exist", instance, task_id);
-            return guest::Async::Error(guest::Error::NotFound).into();
-        }
-    };
-
-    // Complete the task on the guest side
-    let completed_task = instance.remove_task(task_id as usize);
-    if msg_len > msg_max_len as u16 {
-        trace!(
-            "[{}] response ({}B) larger than guest buffer ({}B)",
-            instance,
-            msg_len,
-            msg_max_len
-        );
-        return guest::Async::Error(guest::Error::TooBig).into();
+    // Check arguments
+    if msg_max_len <= 0 || msg_max_len > i32::from(u16::max_value()) {
+        trace!("[{}] forward #{}, invalid buffer", instance, task_id);
+        return guest::Async::Error(guest::Error::InvalidInput).into();
     }
 
-    // Copy response message to guest memory
+    // Buffer message from the host
     let memory = ctx.memory_mut(0);
-    let slice = &mut memory[msg_ptr as usize..(msg_ptr + msg_len as i32) as usize];
+    let slice = &mut memory[msg_ptr as usize..(msg_ptr + msg_max_len) as usize];
+    match instance.get_tasks_mut().get_mut(task_id as usize) {
+        Some(task) => {
+            // Check if the task has closed the buffer
+            let resolve = match task.host_future {
+                HostFuture::Resolve(ref mut x) => x,
+                _ => return guest::Async::Error(guest::Error::InvalidInput).into(),
+            };
+            match resolve.poll() {
+                Ok(Async::NotReady) => guest::Async::NotReady.into(),
+                Ok(Async::Ready(item)) => {
+                    let len = item.len();
+                    if len > msg_max_len as usize {
+                        trace!("[{}] forward #{}, item too large", instance, task_id);
+                        return guest::Async::Error(guest::Error::TooBig).into();
+                    }
 
-    trace!("[{}] forward done ({} bytes)", instance, msg_len);
-    if let Some(ref data) = completed_task.data {
-        slice.copy_from_slice(&data);
+                    slice[..len].copy_from_slice(&item);
+                    guest::Async::Ready((len as u16).into()).into()
+                }
+                Err(e) => {
+                    trace!("[{}] forward #{}, poll: {:?}", instance, task_id, e);
+                    guest::Async::Error(guest::Error::InvalidInput).into()
+                }
+            }
+        }
+        // Task doesn't exist
+        None => guest::Async::Error(guest::Error::NotFound).into(),
     }
-    guest::Async::Ready(msg_len.into()).into()
 }
 
 extern "C" fn request_query_name(request: i32, ptr: i32, max_len: i32, ctx: &mut Ctx) -> i32 {
@@ -293,6 +265,37 @@ extern "C" fn request_query_name(request: i32, ptr: i32, max_len: i32, ctx: &mut
 
         slice[..qname_len].copy_from_slice(&qname.clone().into_bytes());
         guest::from_result(Ok(qname_len as i32))
+    } else {
+        // Request with given id does not exist
+        guest::Error::NotFound.into()
+    }
+}
+
+extern "C" fn request_local_addr(request: i32, ptr: i32, max_len: i32, ctx: &mut Ctx) -> i32 {
+    let instance = from_context(ctx);
+    if let Some((ref scope, ..)) = instance.get_requests().get(request as usize) {
+        let memory = ctx.memory_mut(0);
+        let slice = &mut memory[ptr as usize..(ptr + max_len) as usize];
+        // Require the buffer to hold at least an IPv6 address
+        if slice.len() < 16 {
+            return guest::Error::TooBig.into();
+        }
+        // Convert the IP address to slice
+        match scope.local_addr {
+            Some(addr) => match addr.ip() {
+                IpAddr::V4(x) => {
+                    let x = x.octets();
+                    slice[..x.len()].copy_from_slice(&x);
+                    x.len() as i32
+                },
+                IpAddr::V6(x) => {
+                    let x = x.octets();
+                    slice[..x.len()].copy_from_slice(&x);
+                    x.len() as i32
+                },
+            },
+            None => guest::Error::NotFound.into(),
+        }
     } else {
         // Request with given id does not exist
         guest::Error::NotFound.into()
@@ -335,6 +338,7 @@ extern "C" fn local_socket_open(ptr: i32, len: i32, ctx: &mut Ctx) -> i32 {
     let slice = &memory[ptr as usize..(ptr + len) as usize];
 
     // Parse path from the guest
+    // TODO: ensure it's in preconfigured chroot
     let path = match std::str::from_utf8(slice) {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(_) => return guest::Error::InvalidInput.into(),
@@ -348,62 +352,93 @@ extern "C" fn local_socket_open(ptr: i32, len: i32, ctx: &mut Ctx) -> i32 {
 
     // Create an empty buffer
     let task_id = instance.create_task();
-    if let Some(ref mut task) = instance.get_tasks_mut().get_mut(task_id) {
-        task.data = Some(Vec::with_capacity(8192));
-    }
-
-    // Create a new task if not reconnecting
-    trace!("[{}] connecting local stream {:?}", instance, path);
-    let src = GuestStream::new(instance.clone(), task_id);
 
     // Open connection to local socket, and connect guest stream to sink
-    tokio::spawn(
-        UnixStream::connect(&path)
-            .and_then(move |stream| {
-                let (sink, _) = Framed::new(stream, BytesCodec::new()).split();
-                src.forward(sink)
-            })
-            .then(move |res| {
-                // Log stream closure
-                match res {
-                    Ok(_) => trace!("[{}] local stream {:?}, closed", instance, task_id),
-                    Err(e) => warn!(
-                        "[{}] error in stream #{}: {:?}, closed",
-                        instance, task_id, e
-                    ),
-                };
-                Ok(())
-            }),
-    );
+    trace!("[{}] connecting local stream {:?}", instance, path);
+    let instance_clone = instance.clone();
+    tokio::spawn(UnixStream::connect(&path).then(move |res| match res {
+        Ok(stream) => {
+            if let Some(ref mut task) = instance_clone.get_tasks_mut().get_mut(task_id) {
+                task.host_future =
+                    HostFuture::LocalStream((stream, BytesMut::with_capacity(STREAM_BUF_CAPACITY)));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                "[{}] error in stream #{}: {:?}, closed",
+                instance, task_id, e
+            );
+            Ok(())
+        }
+    }));
 
     task_id as i32
+}
+
+/// Write the remaining buffered data to stream and flush.
+fn local_socket_flush(io: &mut UnixStream, buf: &mut BytesMut) -> Poll<(), io::Error> {
+    // Try to flush the buffered data
+    while !buf.is_empty() {
+        let len = futures::try_ready!(io.poll_write(&buf));
+        if len == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        // Advance the buffer to skip over written data
+        drop(buf.split_to(len));
+        if buf.is_empty() {
+            buf.reserve(STREAM_BUF_CAPACITY);
+        }
+    }
+
+    // Try to flush the writer
+    io.poll_flush()
 }
 
 extern "C" fn local_socket_send(task_id: i32, ptr: i32, len: i32, ctx: &mut Ctx) -> i32 {
     let instance = from_context(ctx);
 
     // Check arguments
-    if len < 0 {
-        return guest::Error::InvalidInput.into();
+    if len < 0 || len > u16::max_value() as i32 {
+        trace!("[{}] local stream {}, buflen {}", instance, task_id, len);
+        return guest::Async::Error(guest::Error::InvalidInput).into();
     }
 
-    // If host passed an empty message, flush
-    if len == 0 {
-        if let Some(task) = instance.get_tasks_mut().get_mut(task_id as usize) {
-            // Refuse sends after close
-            if task.closed {
-                return guest::Error::PermissionDenied.into();
+    // Buffer message from the host
+    let memory = ctx.memory_mut(0);
+    let slice = &memory[ptr as usize..(ptr + len) as usize];
+    match instance.get_tasks_mut().get_mut(task_id as usize) {
+        Some(task) => {
+            let (io, buf) = match task.host_future {
+                HostFuture::LocalStream(ref mut data) => data,
+                _ => return guest::Async::Error(guest::Error::InvalidInput).into(),
+            };
+            // If host passed an empty message or if the buffer is full, flush
+            if len == 0 || buf.remaining_mut() < slice.len() {
+                match local_socket_flush(io, buf) {
+                    Ok(Async::NotReady) => return guest::Async::NotReady.into(),
+                    Err(e) => {
+                        trace!("[{}] local stream {}, flush: {:?}", instance, task_id, e);
+                        return guest::Async::Error(guest::Error::Unknown).into();
+                    }
+                    _ => {}
+                }
             }
-            // Wake up task blocked on the stream to poll again
-            if let Some(waiting) = task.waiting.take() {
-                trace!("[{}] local stream #{}, flushed", instance, task_id);
-                waiting.notify();
-            }
-
-            return 0;
+            // Buffer the data
+            buf.extend_from_slice(slice);
+            guest::Async::Ready((len as u16).into()).into()
         }
+        // Task doesn't exist
+        None => return guest::Async::Error(guest::Error::NotFound).into(),
+    }
+}
 
-        return guest::Error::NotFound.into();
+extern "C" fn local_socket_recv(task_id: i32, ptr: i32, len: i32, ctx: &mut Ctx) -> i32 {
+    let instance = from_context(ctx);
+    // Check arguments
+    if len < 0 || len > u16::max_value() as i32 {
+        trace!("[{}] local stream {}, buflen {}", instance, task_id, len);
+        return guest::Async::Error(guest::Error::InvalidInput).into();
     }
 
     // Buffer message from the host
@@ -411,47 +446,34 @@ extern "C" fn local_socket_send(task_id: i32, ptr: i32, len: i32, ctx: &mut Ctx)
     let slice = &mut memory[ptr as usize..(ptr + len) as usize];
     match instance.get_tasks_mut().get_mut(task_id as usize) {
         Some(task) => {
-            // Check if the task has closed the buffer
-            let data = match task.data {
-                Some(ref mut data) => data,
-                None => return guest::Error::PermissionDenied.into(),
+            // Poll the local stream for data
+            let io = match task.host_future {
+                HostFuture::LocalStream((ref mut io, ..)) => io,
+                _ => return guest::Async::Error(guest::Error::InvalidInput).into(),
             };
-            // Flush when buffered enough data
-            if data.len() >= 8192 {
-                if let Some(waiting) = task.waiting.take() {
-                    waiting.notify();
-                }
-                // If there's too much data buffered, return NotReady to the guest and park it.
-                // The current task will be rescheduled when the buffer is flushed again
-                if data.len() >= 65536 {
-                    task.waiting.replace(task::current());
-                    return 0;
+            match io.poll_read(slice) {
+                Ok(Async::NotReady) => guest::Async::NotReady.into(),
+                Ok(Async::Ready(len)) => guest::Async::Ready((len as u16).into()).into(),
+                Err(e) => {
+                    trace!("[{}] local stream {}, poll: {:?}", instance, task_id, e);
+                    guest::Async::Error(guest::Error::InvalidInput).into()
                 }
             }
-
-            data.extend_from_slice(slice);
-            len
         }
         // Task doesn't exist
-        None => return guest::Error::NotFound.into(),
+        None => guest::Async::Error(guest::Error::NotFound).into(),
     }
-}
-
-extern "C" fn local_socket_recv(_task_id: i32, _ptr: i32, _len: i32, _ctx: &mut Ctx) -> i32 {
-    unimplemented!()
 }
 
 extern "C" fn local_socket_close(task_id: i32, ctx: &mut Ctx) -> i32 {
     let instance = from_context(ctx);
 
     // Set the closed flag to initiate teardown
-    trace!("[{}] local stream #{}, closing", instance, task_id);
-    if let Some(task) = instance.get_tasks_mut().get_mut(task_id as usize) {
-        task.closed = true;
-        if let Some(waiting) = task.waiting.take() {
-            waiting.notify();
-        }
+    if instance.get_tasks().contains(task_id as usize) {
+        trace!("[{}] local stream {}, closing", instance, task_id);
+        drop(instance.remove_task(task_id as usize));
+        guest::from_result(Ok(0))
+    } else {
+        guest::Error::NotFound.into()
     }
-
-    0
 }

@@ -9,6 +9,9 @@ use core::ptr::NonNull;
 use futures::prelude::Future;
 use futures::task::{LocalWaker, Poll, UnsafeWake, Waker};
 
+#[cfg(feature = "std")]
+use std::net::IpAddr;
+
 /// Client request handle.
 pub struct Request {
     id: i32,
@@ -54,6 +57,25 @@ impl Request {
     /// Return client request query type in numeric format, e.g. 28 = AAAA.
     pub fn query_type(&self) -> u16 {
         unsafe { host_calls::request_query_type(self.id) }
+    }
+
+    /// Returns the local address for the request.
+    #[cfg(feature = "std")]
+    pub fn local_addr(&self) -> Option<IpAddr> {
+        let mut buf = [0u8; 16];
+        let res = to_result(unsafe {
+            host_calls::request_local_addr(self.id, buf.as_mut_ptr(), buf.len() as i32)
+        });
+
+        match res.ok() {
+            Some(4) => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&buf[..4]);
+                Some(b.into())
+            }
+            Some(16) => Some(IpAddr::from(buf)),
+            _ => None,
+        }
     }
 
     /// Rewrite response bytes to given slice.
@@ -227,74 +249,172 @@ impl Drop for StreamHandle {
 }
 
 /// Stream connected to a local endpoint (e.g. local socket).
-pub struct LocalStream {
-    task: StreamHandle,
-}
+pub struct LocalStream(StreamHandle);
 
 impl LocalStream {
-    /// Create an unconnected stream.
-    pub fn new(path: &str) -> Result<Self, Error> {
-        match StreamHandle::new(path) {
-            Ok(task) => Ok(Self { task }),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Ask host for a connected stream to local endpoint.
-    pub fn connect(path: &str) -> Result<LocalStream, Error> {
+    pub fn connect(path: &str) -> Result<Self, Error> {
         match StreamHandle::new(path) {
-            Ok(task) => Ok(Self { task }),
+            Ok(task) => Ok(Self(task)),
             Err(e) => Err(e),
         }
     }
 
-    /// Poll state of the local stream.
-    pub fn poll_state(&self) -> Result<(), Error> {
-        match to_result(unsafe {
-            host_calls::privileged::local_socket_send(self.task.0, core::ptr::null(), 0)
-        }) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
+    /// Returns inner handle descriptor.
+    #[cfg(feature = "std")]
+    fn handle(&self) -> i32 {
+        (self.0).0
     }
 }
 
 #[cfg(feature = "std")]
-use futures::io::{self, AsyncWrite};
+use futures::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 
 #[cfg(feature = "std")]
 impl AsyncWrite for LocalStream {
     fn poll_write(&mut self, _lw: &LocalWaker, buf: &[u8]) -> Poll<io::Result<usize>> {
         // TODO: split buffer into maximum chunks of 64K as only u16 can be transferred at a time
-        match to_result(unsafe {
-            host_calls::privileged::local_socket_send(self.task.0, buf.as_ptr(), buf.len() as i32)
+        match Async::from(unsafe {
+            host_calls::privileged::local_socket_send(self.handle(), buf.as_ptr(), buf.len() as i32)
         }) {
-            Ok(v) => {
-                if v == 0 {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok(v as usize))
-                }
-            }
-            Err(e) => Poll::Ready(Err(io::ErrorKind::Other.into())),
+            Async::Ready(v) => Poll::Ready(Ok(u16::from(v) as usize)),
+            Async::NotReady => Poll::Pending,
+            Async::Error(_) => Poll::Ready(Err(io::ErrorKind::Other.into())),
         }
     }
 
     fn poll_flush(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
-        Poll::Ready(
-            self.poll_state()
-                .map_err(move |e| io::ErrorKind::Other.into()),
-        )
+        match Async::from(unsafe {
+            host_calls::privileged::local_socket_send(self.handle(), core::ptr::null(), 0)
+        }) {
+            Async::Ready(_) => Poll::Ready(Ok(())),
+            Async::NotReady => Poll::Pending,
+            Async::Error(_) => Poll::Ready(Err(io::ErrorKind::Other.into())),
+        }
     }
 
     fn poll_close(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
         let state =
-            match to_result(unsafe { host_calls::privileged::local_socket_close(self.task.0) }) {
+            match to_result(unsafe { host_calls::privileged::local_socket_close(self.handle()) }) {
                 Ok(_) => Ok(()),
                 Err(_) => Err(io::ErrorKind::Other.into()),
             };
 
         Poll::Ready(state)
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsyncRead for LocalStream {
+    fn poll_read(&mut self, _lw: &LocalWaker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        match Async::from(unsafe {
+            host_calls::privileged::local_socket_recv(
+                self.handle(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        }) {
+            Async::Ready(v) => Poll::Ready(Ok(u16::from(v) as usize)),
+            Async::NotReady => Poll::Pending,
+            Async::Error(_) => Poll::Ready(Err(io::ErrorKind::Other.into())),
+        }
+    }
+}
+
+/// Buffered AsyncRead implementation that follows [BufRead](https://doc.rust-lang.org/std/io/trait.BufRead.html).
+/// This is generally useful for reading delimiter-separated stream.
+#[cfg(feature = "std")]
+pub struct BufferedStream {
+    io: LocalStream,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+#[cfg(feature = "std")]
+impl BufferedStream {
+    async fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.buf.is_empty() {
+            self.buf.resize(self.buf.capacity(), 0);
+            let n = await!(self.io.read(&mut self.buf))?;
+            self.buf.resize(n, 0);
+            self.pos = 0;
+        }
+        Ok(&self.buf[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos += amt;
+        if self.pos == self.buf.len() {
+            self.pos = 0;
+            self.buf.clear();
+        }
+    }
+
+    pub async fn read_until(&mut self, delim: u8, mut buf: Vec<u8>) -> io::Result<Vec<u8>> {
+        loop {
+            let (done, used) = {
+                let available = match await!(self.fill_buf()) {
+                    Ok(n) => n,
+                    Err(e) => return Err(e),
+                };
+                match core::slice::memchr::memchr(delim, available) {
+                    Some(i) => {
+                        buf.extend_from_slice(&available[..=i]);
+                        (true, i + 1)
+                    }
+                    None => {
+                        buf.extend_from_slice(available);
+                        (false, available.len())
+                    }
+                }
+            };
+            self.consume(used);
+            if done || used == 0 {
+                return Ok(buf);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsyncRead for BufferedStream {
+    fn poll_read(&mut self, lw: &LocalWaker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        // Drain the buffered data and continue with unbuffered reading to avoid copies
+        if !self.buf.is_empty() {
+            let inner = &self.buf[self.pos..];
+            let len = std::cmp::min(inner.len(), buf.len());
+            buf[..len].copy_from_slice(&inner[..len]);
+            self.consume(len);
+            Poll::Ready(Ok(len))
+        } else {
+            self.io.poll_read(lw, buf)
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsyncWrite for BufferedStream {
+    fn poll_write(&mut self, lw: &LocalWaker, buf: &[u8]) -> Poll<io::Result<usize>> {
+        self.io.poll_write(lw, buf)
+    }
+
+    fn poll_flush(&mut self, lw: &LocalWaker) -> Poll<io::Result<()>> {
+        self.io.poll_flush(lw)
+    }
+
+    fn poll_close(&mut self, lw: &LocalWaker) -> Poll<io::Result<()>> {
+        self.io.poll_close(lw)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<LocalStream> for BufferedStream {
+    fn from(io: LocalStream) -> BufferedStream {
+        BufferedStream {
+            io,
+            buf: Vec::with_capacity(512),
+            pos: 0,
+        }
     }
 }
 

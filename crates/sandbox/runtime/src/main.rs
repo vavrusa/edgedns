@@ -66,11 +66,13 @@ fn main() {
             // Listen and process incoming messages
             if let Some(address) = matches.value_of("listen") {
                 info!("processing messages from {}", address);
-                let socket = UdpSocket::bind(&address.parse::<SocketAddr>().unwrap()).unwrap();
+                let local_addr = address.parse::<SocketAddr>().unwrap();
+                let socket = UdpSocket::bind(&local_addr).unwrap();
 
                 let (mut sink, mut stream) = FramedStream::from(socket).split();
                 while let Some(Ok((msg, from))) = await!(stream.next()) {
-                    let scope = Scope::new(msg.clone().into(), from).expect("scope");
+                    let mut scope = Scope::new(msg.clone().into(), from).expect("scope");
+                    scope.set_local_addr(local_addr.clone(), false);
                     trace!("processing {} bytes from {}", msg.len(), from);
 
                     // Create a response builder

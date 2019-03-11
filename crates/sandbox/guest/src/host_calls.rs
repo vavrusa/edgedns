@@ -20,6 +20,7 @@ extern "C" {
     // Hostcalls related to request
     pub fn request_query_name(request: i32, ptr: *mut u8, max_len: i32) -> i32;
     pub fn request_query_type(request: i32) -> u16;
+    pub fn request_local_addr(request: i32, ptr: *mut u8, max_len: i32) -> i32;
     pub fn request_set_response(request: i32, ptr: *const u8, len: i32) -> i32;
 }
 

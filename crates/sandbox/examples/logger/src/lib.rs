@@ -6,9 +6,10 @@ use wee_alloc;
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
 use futures::io::AsyncWriteExt;
-use guest::{self, async_block, await, Action, Delay, LocalStream};
+use guest::{self, Action, Delay, LocalStream};
 use std::rc::Rc;
 use std::sync::Mutex;
+use embrio_async::{async_block, await};
 
 // Include generated schema bindings
 use byteorder::{ByteOrder, LittleEndian};
@@ -77,9 +78,11 @@ fn watch_local_socket(stream: Rc<Mutex<Option<LocalStream>>>) -> Result<(), gues
             // Attempt to reconnect if errored out
             let mut guard = stream.lock().unwrap();
             if guard.is_none() {
-                match LocalStream::new("test.sock") {
-                    Ok(stream) => { guard.replace(stream); },
-                    Err(e) => {},
+                match LocalStream::connect("test.sock") {
+                    Ok(stream) => {
+                        guard.replace(stream);
+                    },
+                    Err(_) => {},
                 }
             }
         }

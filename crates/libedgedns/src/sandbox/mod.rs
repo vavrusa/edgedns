@@ -1,8 +1,9 @@
 use crate::{Context, Scope};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use core::ffi::c_void;
+use domain_core::bits::Message;
 use futures::future::{Either, Shared};
-use futures::sync::oneshot::{channel, Receiver, Sender};
+use futures::sync::oneshot::{self, Receiver, Sender};
 use guest;
 use log::*;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -12,7 +13,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
+use tokio::net::UnixStream;
 use tokio::prelude::*;
+use tokio::timer;
 
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
@@ -97,7 +100,7 @@ pub fn instantiate(name: String, data: &[u8], context: Arc<Context>) -> error::R
             request_states: RwLock::new(Slab::new()),
             callback_message: RwLock::new(HashMap::new()),
             cancel: {
-                let (s, r) = channel();
+                let (s, r) = oneshot::channel();
                 (Mutex::new(Some(s)), r.shared())
             },
         });
@@ -257,108 +260,23 @@ impl GuestCallback {
     }
 }
 
+pub enum HostFuture {
+    None,
+    Resolve(Box<Future<Item = Message, Error = Error>>),
+    LocalStream((UnixStream, BytesMut)),
+    Delay(timer::Delay),
+}
+
+impl Default for HostFuture {
+    fn default() -> Self {
+        HostFuture::None
+    }
+}
+
 #[derive(Default)]
 struct GuestFutureState {
     cb: GuestCallback,
-    data: Option<Vec<u8>>,
-    waiting: Option<task::Task>,
-    closed: bool,
-}
-
-/// Future representing a guest generated stream of items.
-struct GuestStream {
-    instance: Instance,
-    task_handle: usize,
-    cancel: Shared<Receiver<()>>,
-}
-
-impl GuestStream {
-    fn new(instance: Instance, task_handle: usize) -> Self {
-        Self {
-            cancel: instance.cancel.1.clone(),
-            instance,
-            task_handle,
-        }
-    }
-}
-
-impl Stream for GuestStream {
-    type Item = Bytes;
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        try_poll_cancel(&mut self.cancel)?;
-
-        match self.instance.get_tasks_mut().get_mut(self.task_handle) {
-            Some(GuestFutureState {
-                ref mut data,
-                ref mut waiting,
-                closed,
-                ..
-            }) => {
-                let data = match data {
-                    Some(ref mut data) => data,
-                    None => return Err(ErrorKind::UnexpectedEof.into()),
-                };
-
-                // Remember task blocked on NotReady for later wakeup
-                if data.is_empty() {
-                    trace!(
-                        "[{}] polling stream #{}, not ready",
-                        self.instance,
-                        self.task_handle
-                    );
-                    // Return EOF if all buffered data has been processed and closed flag is raised
-                    if *closed {
-                        trace!(
-                            "[{}] polling stream #{}, EOF",
-                            self.instance,
-                            self.task_handle
-                        );
-                        if let Some(task) = waiting.take() {
-                            task.notify();
-                        }
-                        return Ok(Async::Ready(None));
-                    } else {
-                        // Remember task blocked on NotReady for later wakeup
-                        waiting.replace(task::current());
-                        return Ok(Async::NotReady);
-                    }
-                }
-
-                let v = Bytes::from(data.clone());
-                trace!(
-                    "[{}] polling stream #{}, ready {}B",
-                    self.instance,
-                    self.task_handle,
-                    v.len()
-                );
-                data.clear();
-
-                // Wake up the task waiting on this stream
-                if let Some(task) = waiting.take() {
-                    task.notify();
-                }
-
-                Ok(Async::Ready(Some(v)))
-            }
-            None => {
-                trace!(
-                    "[{}] tried polling stream #{}, not found",
-                    self.instance,
-                    self.task_handle
-                );
-                Err(ErrorKind::NotFound.into())
-            }
-        }
-    }
-}
-
-impl Drop for GuestStream {
-    fn drop(&mut self) {
-        trace!("[{}] dropping stream #{}", self.instance, self.task_handle);
-        drop(self.instance.remove_task(self.task_handle))
-    }
+    host_future: HostFuture,
 }
 
 /// Future representing an asynchronous guest computation.

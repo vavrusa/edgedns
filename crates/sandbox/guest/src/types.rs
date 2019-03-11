@@ -110,6 +110,16 @@ pub enum Async {
     Ready(AsyncValue),
 }
 
+impl Async {
+    /// Returns true if the Async value is ready.
+    pub fn is_ready(&self) -> bool {
+        match self {
+            Async::NotReady => false,
+            _ => true,
+        }
+    }
+}
+
 /// Convert enum to i32.
 impl From<Async> for i32 {
     fn from(v: Async) -> i32 {

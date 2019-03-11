@@ -1,14 +1,20 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![feature(
-    async_await,
-    futures_api,
-    generators,
     integer_atomics,
     alloc,
     format_args_nl,
     alloc_error_handler,
     core_intrinsics,
-    proc_macro_hygiene
+    proc_macro_hygiene,
+    slice_internals
+)]
+#![cfg_attr(
+    all(feature = "futures"),
+    feature(async_await, futures_api, generators)
+)]
+#![cfg_attr(
+    all(feature = "futures", feature = "std"),
+    feature(await_macro)
 )]
 
 extern crate alloc;
@@ -22,10 +28,6 @@ pub mod host_calls;
 
 mod types;
 pub use types::*;
-
-// TODO: https://github.com/rust-lang/rust/issues/56974
-#[cfg(feature = "futures")]
-pub use embrio_async::{async_block, await};
 
 /// Convert host call encoded result (`i32`) into `Result`.
 pub fn to_result(raw: i32) -> Result {

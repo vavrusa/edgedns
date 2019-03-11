@@ -158,7 +158,6 @@ dependencies = [
 name = "guest"
 version = "0.1.0"
 dependencies = [
- "embrio-async 0.1.0 (git+https://github.com/Nemo157/embrio-rs?rev=73853731f00b1babefe572fe8b339f188e1a17db)",
  "futures-preview 0.3.0-alpha.12 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 

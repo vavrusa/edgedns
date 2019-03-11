@@ -16,7 +16,8 @@ use wee_alloc;
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
 use futures::future::{self, TryFutureExt};
-use guest::{self, async_block, await, Action, Delay, Forward};
+use guest::{self, Action, Delay, Forward};
+use embrio_async::{async_block, await};
 
 #[no_mangle]
 pub extern "C" fn run() {

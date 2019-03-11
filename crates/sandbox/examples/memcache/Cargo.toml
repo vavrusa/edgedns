@@ -1,0 +1,26 @@
+[package]
+name = "memcache"
+version = "0.1.0"
+authors = ["Marek Vavruša <mvavrusa@cloudflare.com>"]
+edition = "2018"
+publish = false
+
+[lib]
+name = "memcache"
+crate-type = ["cdylib"]
+
+[features]
+default = ["wee_alloc"]
+
+[dependencies]
+futures-preview = { version = "=0.3.0-alpha.12", default-features = false, features = ["nightly", "std"]}
+wee_alloc = {version = "0.4", optional = true}
+guest = {path = "../../guest", features = ["std"]}
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 'z'
+
+[workspace]
+members = []

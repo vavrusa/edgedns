@@ -1,4 +1,3 @@
-use alloc::string::String;
 use core::fmt;
 
 /// Result type used between host and guest.
@@ -219,5 +218,13 @@ pub fn from_result(res: Result) -> i32 {
     match res {
         Ok(v) => v,
         Err(e) => e.into(),
+    }
+}
+
+/// Convert host call encoded result (`i32`) into `Result`.
+pub fn to_result(raw: i32) -> Result {
+    match raw >= 0 {
+        true => Ok(raw),
+        false => Err(Error::from(raw)),
     }
 }

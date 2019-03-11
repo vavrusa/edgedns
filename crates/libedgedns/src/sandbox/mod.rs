@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use domain_core::bits::Message;
 use futures::future::{Either, Shared};
 use futures::sync::oneshot::{self, Receiver, Sender};
-use guest;
+use guest_types as guest;
 use log::*;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use slab::Slab;

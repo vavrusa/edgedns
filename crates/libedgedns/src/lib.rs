@@ -1,7 +1,7 @@
 //! Import all the required crates, instanciate the main components and start
 //! the service.
 #![recursion_limit = "128"]
-#![feature(await_macro, async_await, futures_api, test, non_exhaustive, try_from)]
+#![feature(await_macro, async_await, futures_api, test, non_exhaustive)]
 extern crate test;
 
 mod cache;

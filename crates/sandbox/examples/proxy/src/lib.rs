@@ -12,6 +12,7 @@ use guest::{self, Action, Delay, Forward};
 
 #[no_mangle]
 pub extern "C" fn run() {
+    guest::default_panic_handler();
     guest::debug!("hello from guest");
 
     // Spawn a future from guest

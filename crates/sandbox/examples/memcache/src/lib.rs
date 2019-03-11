@@ -23,6 +23,7 @@ mod memcache;
 
 #[no_mangle]
 pub extern "C" fn run() {
+    guest::default_panic_handler();
     let kv = Rc::new(Mutex::new(None));
 
     // Reconnect to local memcache socket

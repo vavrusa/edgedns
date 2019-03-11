@@ -615,7 +615,12 @@ name = "guest"
 version = "0.1.0"
 dependencies = [
  "futures-preview 0.3.0-alpha.13 (registry+https://github.com/rust-lang/crates.io-index)",
+ "guest-types 0.1.0",
 ]
+
+[[package]]
+name = "guest-types"
+version = "0.1.0"
 
 [[package]]
 name = "h2"
@@ -804,7 +809,7 @@ dependencies = [
  "failure 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "failure_derive 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.25 (registry+https://github.com/rust-lang/crates.io-index)",
- "guest 0.1.0",
+ "guest-types 0.1.0",
  "hex 0.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "http 0.1.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "jumphash 0.1.5 (git+https://github.com/jedisct1/rust-jumphash)",

@@ -41,4 +41,4 @@ zipkin-reporter-http = {git = "https://github.com/vavrusa/rust-zipkin", rev = "c
 http = "0.1"
 slab = "0.4"
 wasmer-runtime = "0.1"
-guest = {path = "../sandbox/guest"}
+guest-types = {path = "../sandbox/guest-types"}

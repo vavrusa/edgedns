@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use domain_core::bits::*;
 use domain_core::iana::{Class, Rcode, Rtype};
 use domain_core::rdata::{AllRecordData, Txt};
-use guest::{Action, Phase};
+use guest_types::{Action, Phase};
 use lazy_static::*;
 use log::*;
 use std::io::ErrorKind;

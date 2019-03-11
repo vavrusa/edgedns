@@ -1,7 +1,7 @@
 use super::{from_context, GuestCallback, HostFuture};
 use crate::{forwarder, Scope};
 use bytes::{BufMut, BytesMut};
-use guest;
+use guest_types as guest;
 use log::*;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

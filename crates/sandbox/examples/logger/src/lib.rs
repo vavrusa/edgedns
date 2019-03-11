@@ -21,6 +21,7 @@ mod schema_capnp {
 
 #[no_mangle]
 pub extern "C" fn run() {
+    guest::default_panic_handler();
     let stream = Rc::new(Mutex::new(None));
 
     // Watch the open connection

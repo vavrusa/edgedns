@@ -4,7 +4,7 @@ use crate::context::Context;
 use crate::query_router::Scope;
 use crate::sandbox::{self, fsloader::FSLoader, Instance};
 use bytes::BytesMut;
-use guest;
+use guest_types as guest;
 use log::*;
 use parking_lot::RwLock;
 use std::collections::HashMap;

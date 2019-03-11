@@ -150,7 +150,12 @@ name = "guest"
 version = "0.1.0"
 dependencies = [
  "futures-preview 0.3.0-alpha.13 (registry+https://github.com/rust-lang/crates.io-index)",
+ "guest-types 0.1.0",
 ]
+
+[[package]]
+name = "guest-types"
+version = "0.1.0"
 
 [[package]]
 name = "iovec"

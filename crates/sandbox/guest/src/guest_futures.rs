@@ -5,12 +5,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::pin::Pin;
-use core::ptr::NonNull;
 use futures::prelude::Future;
-use futures::task::{LocalWaker, Poll, UnsafeWake, Waker};
-
-#[cfg(feature = "std")]
+use futures::task::{Waker, Poll};
+use futures::task::{noop_waker_ref};
 use std::net::IpAddr;
+use futures::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 
 /// Client request handle.
 pub struct Request {
@@ -60,7 +59,6 @@ impl Request {
     }
 
     /// Returns the local address for the request.
-    #[cfg(feature = "std")]
     pub fn local_addr(&self) -> Option<IpAddr> {
         let mut buf = [0u8; 16];
         let res = to_result(unsafe {
@@ -133,7 +131,7 @@ impl Delay {
 impl Future for Delay {
     type Output = Result<(), Error>;
 
-    fn poll(mut self: Pin<&mut Self>, _lw: &LocalWaker) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, _lw: &Waker) -> Poll<Self::Output> {
         // Create task if it doesn't exist
         if self.task_id.is_none() {
             self.task_id = match to_result(unsafe { host_calls::timer_create(self.duration_ms) }) {
@@ -183,7 +181,7 @@ impl<'a> Forward<'a> {
 impl<'a> Future for Forward<'a> {
     type Output = Result<Vec<u8>, Error>;
 
-    fn poll(mut self: Pin<&mut Self>, _lw: &LocalWaker) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, _lw: &Waker) -> Poll<Self::Output> {
         if self.task_id < 0 {
             self.task_id = unsafe {
                 host_calls::forward_create(
@@ -261,18 +259,15 @@ impl LocalStream {
     }
 
     /// Returns inner handle descriptor.
-    #[cfg(feature = "std")]
     fn handle(&self) -> i32 {
         (self.0).0
     }
 }
 
-#[cfg(feature = "std")]
-use futures::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 
-#[cfg(feature = "std")]
+
 impl AsyncWrite for LocalStream {
-    fn poll_write(&mut self, _lw: &LocalWaker, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(&mut self, _lw: &Waker, buf: &[u8]) -> Poll<io::Result<usize>> {
         // TODO: split buffer into maximum chunks of 64K as only u16 can be transferred at a time
         match Async::from(unsafe {
             host_calls::privileged::local_socket_send(self.handle(), buf.as_ptr(), buf.len() as i32)
@@ -283,7 +278,7 @@ impl AsyncWrite for LocalStream {
         }
     }
 
-    fn poll_flush(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
+    fn poll_flush(&mut self, _lw: &Waker) -> Poll<io::Result<()>> {
         match Async::from(unsafe {
             host_calls::privileged::local_socket_send(self.handle(), core::ptr::null(), 0)
         }) {
@@ -293,7 +288,7 @@ impl AsyncWrite for LocalStream {
         }
     }
 
-    fn poll_close(&mut self, _lw: &LocalWaker) -> Poll<io::Result<()>> {
+    fn poll_close(&mut self, _lw: &Waker) -> Poll<io::Result<()>> {
         let state =
             match to_result(unsafe { host_calls::privileged::local_socket_close(self.handle()) }) {
                 Ok(_) => Ok(()),
@@ -304,9 +299,8 @@ impl AsyncWrite for LocalStream {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsyncRead for LocalStream {
-    fn poll_read(&mut self, _lw: &LocalWaker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(&mut self, _lw: &Waker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         match Async::from(unsafe {
             host_calls::privileged::local_socket_recv(
                 self.handle(),
@@ -323,14 +317,12 @@ impl AsyncRead for LocalStream {
 
 /// Buffered AsyncRead implementation that follows [BufRead](https://doc.rust-lang.org/std/io/trait.BufRead.html).
 /// This is generally useful for reading delimiter-separated stream.
-#[cfg(feature = "std")]
 pub struct BufferedStream {
     io: LocalStream,
     buf: Vec<u8>,
     pos: usize,
 }
 
-#[cfg(feature = "std")]
 impl BufferedStream {
     async fn fill_buf(&mut self) -> io::Result<&[u8]> {
         if self.buf.is_empty() {
@@ -376,9 +368,8 @@ impl BufferedStream {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsyncRead for BufferedStream {
-    fn poll_read(&mut self, lw: &LocalWaker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(&mut self, lw: &Waker, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         // Drain the buffered data and continue with unbuffered reading to avoid copies
         if !self.buf.is_empty() {
             let inner = &self.buf[self.pos..];
@@ -392,22 +383,20 @@ impl AsyncRead for BufferedStream {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsyncWrite for BufferedStream {
-    fn poll_write(&mut self, lw: &LocalWaker, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(&mut self, lw: &Waker, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.io.poll_write(lw, buf)
     }
 
-    fn poll_flush(&mut self, lw: &LocalWaker) -> Poll<io::Result<()>> {
+    fn poll_flush(&mut self, lw: &Waker) -> Poll<io::Result<()>> {
         self.io.poll_flush(lw)
     }
 
-    fn poll_close(&mut self, lw: &LocalWaker) -> Poll<io::Result<()>> {
+    fn poll_close(&mut self, lw: &Waker) -> Poll<io::Result<()>> {
         self.io.poll_close(lw)
     }
 }
 
-#[cfg(feature = "std")]
 impl From<LocalStream> for BufferedStream {
     fn from(io: LocalStream) -> BufferedStream {
         BufferedStream {
@@ -421,7 +410,7 @@ impl From<LocalStream> for BufferedStream {
 fn poll_future<I: Into<AsyncValue> + 'static, F: Future<Output = Result<I, Error>>>(
     future: &mut F,
 ) -> Async {
-    let local_waker = unsafe { LocalWaker::new(NoopWaker::get()) };
+    let local_waker = noop_waker_ref();
     let mut future = unsafe { Pin::new_unchecked(future) };
     match future.as_mut().poll(&local_waker) {
         Poll::Pending => Async::NotReady,
@@ -490,26 +479,6 @@ where
     unsafe {
         host_calls::register_on_message(Phase::PreCache as i32, Box::into_raw(wrapped_closure))
     };
-}
-
-/// No-op waker for task notifications.
-struct NoopWaker {}
-static WAKER: NoopWaker = NoopWaker {};
-
-impl NoopWaker {
-    #[inline]
-    pub fn get() -> NonNull<NoopWaker> {
-        NonNull::from(&WAKER)
-    }
-}
-
-unsafe impl UnsafeWake for NoopWaker {
-    unsafe fn clone_raw(&self) -> Waker {
-        Waker::new(NoopWaker::get())
-    }
-
-    unsafe fn drop_raw(&self) {}
-    unsafe fn wake(&self) {}
 }
 
 // Trampoline for exported closures

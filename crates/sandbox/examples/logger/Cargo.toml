@@ -11,10 +11,9 @@ name = "logger"
 crate-type = ["cdylib"]
 
 [dependencies]
-futures-preview = { version = "=0.3.0-alpha.12" }
-embrio-async = {git = "https://github.com/Nemo157/embrio-rs", rev = "73853731f00b1babefe572fe8b339f188e1a17db"}
-wee_alloc = {version = "0.4"}
-guest = {path = "../../guest", features = ["futures", "std"]}
+futures-preview = { version = "=0.3.0-alpha.13", default-features = false }
+wee_alloc = { version = "0.4" }
+guest = { path = "../../guest" }
 capnp = "0.9"
 byteorder = "1"
 

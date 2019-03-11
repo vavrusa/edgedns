@@ -1,4 +1,3 @@
-#![cfg_attr(not(feature = "std"), no_std)]
 #![feature(
     integer_atomics,
     alloc,
@@ -10,11 +9,7 @@
 )]
 #![cfg_attr(
     all(feature = "futures"),
-    feature(async_await, futures_api, generators)
-)]
-#![cfg_attr(
-    all(feature = "futures", feature = "std"),
-    feature(await_macro)
+    feature(async_await, await_macro, futures_api, generators)
 )]
 
 extern crate alloc;

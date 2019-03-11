@@ -1,4 +1,4 @@
-#![feature(async_await, futures_api, generators, proc_macro_hygiene)]
+#![feature(async_await, await_macro, futures_api)]
 
 // Use `wee_alloc` as the global allocator.
 use wee_alloc;
@@ -9,7 +9,6 @@ use futures::io::AsyncWriteExt;
 use guest::{self, Action, Delay, LocalStream};
 use std::rc::Rc;
 use std::sync::Mutex;
-use embrio_async::{async_block, await};
 
 // Include generated schema bindings
 use byteorder::{ByteOrder, LittleEndian};
@@ -30,7 +29,7 @@ pub extern "C" fn run() {
     // Serialize log for each message and write it to the stream
     guest::for_each_message(move |mut req| {
         let stream = stream.clone();
-        async_block! {
+        async move {
             let mut guard = stream.lock().unwrap();
             let stream = match &mut *guard {
                 Some(ref mut stream) => stream,
@@ -73,7 +72,7 @@ pub extern "C" fn run() {
 }
 
 fn watch_local_socket(stream: Rc<Mutex<Option<LocalStream>>>) -> Result<(), guest::Error> {
-    guest::spawn(async_block! {
+    guest::spawn(async move {
         while await!(Delay::from_millis(5_000)).is_ok() {
             // Attempt to reconnect if errored out
             let mut guard = stream.lock().unwrap();

@@ -26,7 +26,7 @@ toml = "0.4"
 bytes = "*"
 stream-cancel = "0.4"
 jumphash = {git = "https://github.com/jedisct1/rust-jumphash"}
-tokio = {version = "0.1.15", features=["async-await-preview"]}
+tokio = {version = "0.1.16", features=["async-await-preview"]}
 native-tls = "0.2"
 tokio-tls = "0.2"
 domain-core = {git = "https://github.com/vavrusa/domain-core", rev = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}

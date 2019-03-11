@@ -13,9 +13,9 @@ crate-type = ["cdylib"]
 default = ["wee_alloc"]
 
 [dependencies]
-futures-preview = { version = "=0.3.0-alpha.12", default-features = false, features = ["nightly", "std"]}
-wee_alloc = {version = "0.4", optional = true}
-guest = {path = "../../guest", features = ["std"]}
+futures-preview = { version = "=0.3.0-alpha.13", default-features = false, features = ["nightly"]}
+wee_alloc = { version = "0.4", optional = true}
+guest = { path = "../../guest" }
 
 [profile.release]
 lto = true

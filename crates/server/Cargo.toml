@@ -29,6 +29,6 @@ mime = "*"
 prometheus = "*"
 socket2 = {version = "*", features = ["reuseport"]}
 stream-cancel = "0.4"
-tokio = {version = "0.1.15", features=["async-await-preview"]}
+tokio = {version = "0.1.16", features=["async-await-preview"]}
 tokio-signal = "0.2"
 listenfd = "0.3"

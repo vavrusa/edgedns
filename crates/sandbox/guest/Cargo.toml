@@ -6,8 +6,7 @@ edition = "2018"
 
 [features]
 default = ["futures"]
-futures = ["futures-preview"]
-std = ["futures-preview/std"]
+futures = ["futures-preview/std"]
 
 [dependencies]
-futures-preview = { version = "=0.3.0-alpha.12", default-features = false, optional = true }
+futures-preview = { version = "=0.3.0-alpha.13", default-features = false, optional = true }

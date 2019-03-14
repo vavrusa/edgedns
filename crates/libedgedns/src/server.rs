@@ -5,6 +5,7 @@ use crate::error::Result;
 use crate::query_router::{QueryRouter, Scope};
 use bytes::{Bytes, BytesMut};
 use futures::sync::mpsc;
+use guest_types::Protocol;
 use log::*;
 use parking_lot::Mutex;
 use socket2::{Domain, Socket, Type};

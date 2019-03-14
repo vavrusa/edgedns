@@ -91,7 +91,7 @@ impl From<&Arc<Config>> for Sandbox {
     fn from(config: &Arc<Config>) -> Self {
         let loader = match config.apps_location {
             Some(ref uri) => match uri.scheme_str() {
-                None => {
+                Some("file") | None => {
                     let path = Path::new(uri.path());
                     Some(Loader::FS(Arc::new(FSLoader::new(
                         path,

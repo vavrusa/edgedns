@@ -4,6 +4,7 @@ extern "C" {
     pub fn register_future(closure: *mut FnMut() -> i32) -> i32;
     pub fn register_on_message(phase: i32, closure: *mut FnMut(i32) -> i32) -> i32;
     pub fn debug(ptr: i32, len: i32);
+    pub fn timestamp(secs_ptr: *mut u8, nsecs_ptr: *mut u8) -> i32;
 
     // Provided I/O operations
     pub fn timer_poll(timer: i32) -> i32;
@@ -21,7 +22,12 @@ extern "C" {
     pub fn request_query_name(request: i32, ptr: *mut u8, max_len: i32) -> i32;
     pub fn request_query_type(request: i32) -> u16;
     pub fn request_local_addr(request: i32, ptr: *mut u8, max_len: i32) -> i32;
+    pub fn request_remote_addr(request: i32, ptr: *mut u8, max_len: i32) -> i32;
+    pub fn request_get_response(request: i32, ptr: *const u8, len: i32) -> i32;
     pub fn request_set_response(request: i32, ptr: *const u8, len: i32) -> i32;
+    pub fn request_protocol(request: i32) -> i32;
+    pub fn request_from_cache(request: i32) -> i32;
+    pub fn request_elapsed(request: i32, secs_ptr: *mut u8, nsecs_ptr: *mut u8) -> i32;
 }
 
 // Privileged hostcalls

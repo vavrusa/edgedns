@@ -1,5 +1,4 @@
 use crate::cache::{CacheEntry, CacheKey};
-use crate::codecs::Protocol;
 use crate::config::ServerType;
 use crate::context::Context;
 use crate::error::Result;
@@ -12,13 +11,14 @@ use bytes::{Bytes, BytesMut};
 use domain_core::bits::*;
 use domain_core::iana::{Class, Rcode, Rtype};
 use domain_core::rdata::{AllRecordData, Txt};
-use guest_types::{Action, Phase};
+use guest_types::{Action, Phase, Protocol};
 use lazy_static::*;
 use log::*;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use stream_cancel::Tripwire;
 use tokio::await;
 
@@ -60,6 +60,8 @@ pub struct Scope {
     pub is_internal: bool,
     pub protocol: Protocol,
     pub(crate) trace_span: Option<tracing::Span>,
+    pub from_cache: bool,
+    pub start_time: Instant,
 }
 
 impl Clone for Scope {
@@ -72,6 +74,8 @@ impl Clone for Scope {
             is_internal: self.is_internal,
             protocol: self.protocol,
             trace_span: None,
+            from_cache: self.from_cache,
+            start_time: self.start_time.clone(),
         }
     }
 }
@@ -91,6 +95,8 @@ impl Scope {
                     is_internal: false,
                     protocol: Protocol::default(),
                     trace_span: None,
+                    from_cache: false,
+                    start_time: Instant::now(),
                 })
             }
             None => Err(ErrorKind::UnexpectedEof.into()),
@@ -217,13 +223,14 @@ impl QueryRouter {
         match action {
             Action::Deliver => return Ok(answer),
             Action::Drop => return self.resolve_to_error(&scope, answer, Rcode::Refused, false),
-            Action::Pass => {},
+            Action::Pass => {}
         }
 
         let mut cache = self.context.cache.clone();
         let cache_key = CacheKey::from(&scope);
-        match cache.get(&cache_key) {
+        let result = match cache.get(&cache_key) {
             Some(entry) => {
+                scope.from_cache = true;
                 varz.client_queries_cached.inc();
                 self.resolve_from_cache(&scope, entry, answer)
             }
@@ -269,6 +276,20 @@ impl QueryRouter {
                     }
                 }
             }
+        };
+
+        match result {
+            Ok(answer) => {
+                let (answer, action) = await!(self.sandbox.resolve(Phase::Finish, &scope, answer));
+                match action {
+                    Action::Deliver => return Ok(answer),
+                    Action::Drop => {
+                        return self.resolve_to_error(&scope, answer, Rcode::Refused, false);
+                    }
+                    Action::Pass => return Ok(answer),
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -438,7 +459,6 @@ impl QueryRouter {
 
         Ok(message.finish())
     }
-
 }
 
 #[cfg(test)]

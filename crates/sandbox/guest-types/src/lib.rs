@@ -201,6 +201,7 @@ pub enum Phase {
     Invalid = 0,
     PreCache = 1,
     PostCache = 2,
+    Finish = 10,
 }
 
 impl From<i32> for Phase {
@@ -208,6 +209,7 @@ impl From<i32> for Phase {
         match n {
             1 => Phase::PreCache,
             2 => Phase::PostCache,
+            10 => Phase::Finish,
             _ => Phase::Invalid,
         }
     }
@@ -226,5 +228,33 @@ pub fn to_result(raw: i32) -> Result {
     match raw >= 0 {
         true => Ok(raw),
         false => Err(Error::from(raw)),
+    }
+}
+
+/// Enum of used server protocols.
+#[derive(Clone, Copy, Debug)]
+pub enum Protocol {
+    Unknown = 0,
+    Udp = 1,
+    Tcp = 2,
+    Tls = 3,
+    Https = 4,
+}
+
+impl Default for Protocol {
+    fn default() -> Self {
+        Protocol::Udp
+    }
+}
+
+impl From<i32> for Protocol {
+    fn from(n: i32) -> Protocol {
+        match n {
+            1 => Protocol::Udp,
+            2 => Protocol::Tcp,
+            3 => Protocol::Tls,
+            4 => Protocol::Https,
+            _ => Protocol::Unknown,
+        }
     }
 }

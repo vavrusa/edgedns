@@ -1,26 +1,12 @@
 use bytes::{Bytes, BytesMut};
 use futures::{prelude::*, try_ready};
+use guest_types::Protocol;
 use std::net::SocketAddr;
 use tokio::codec::length_delimited::*;
 use tokio::codec::*;
 use tokio::net::tcp::TcpStream;
 use tokio::net::udp::{UdpFramed, UdpSocket};
 use tokio_tls::TlsStream;
-
-/// Enum of used server protocols.
-#[derive(Clone, Copy, Debug)]
-pub enum Protocol {
-    Udp,
-    Tcp,
-    Tls,
-    Https,
-}
-
-impl Default for Protocol {
-    fn default() -> Self {
-        Protocol::Udp
-    }
-}
 
 /// Wrapper for any kind of DNS message stream.
 pub enum FramedStream {

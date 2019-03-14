@@ -1,15 +1,16 @@
 use crate::{host_calls, to_result};
-use crate::{Action, Async, AsyncState, AsyncValue, Error, Phase};
+use crate::{Action, Async, AsyncState, AsyncValue, Error, Phase, Protocol};
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::pin::Pin;
-use futures::prelude::Future;
-use futures::task::{Waker, Poll};
-use futures::task::{noop_waker_ref};
-use std::net::IpAddr;
 use futures::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
+use futures::prelude::Future;
+use futures::task::noop_waker_ref;
+use futures::task::{Poll, Waker};
+use std::net::IpAddr;
+use std::time::Duration;
 
 /// Client request handle.
 pub struct Request {
@@ -76,6 +77,62 @@ impl Request {
         }
     }
 
+    /// Returns the remote address for the request.
+    pub fn remote_addr(&self) -> Option<IpAddr> {
+        let mut buf = [0u8; 16];
+        let res = to_result(unsafe {
+            host_calls::request_remote_addr(self.id, buf.as_mut_ptr(), buf.len() as i32)
+        });
+
+        match res.ok() {
+            Some(4) => {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&buf[..4]);
+                Some(b.into())
+            }
+            Some(16) => Some(IpAddr::from(buf)),
+            _ => None,
+        }
+    }
+
+    /// Get response for current request.
+    pub fn get_response(&mut self) -> Result<&[u8], Error> {
+        let mut buf_size = 512;
+        let (step, max) = (512, 4096);
+
+        loop {
+            // Reserve enough space for answer in the buffer
+            self.buf.resize(buf_size, 0);
+
+            // Fetch data
+            let rc = unsafe {
+                host_calls::request_get_response(
+                    self.id,
+                    self.buf.as_mut_ptr(),
+                    self.buf.len() as i32,
+                )
+            };
+
+            match to_result(rc) {
+                Ok(len) => {
+                    return Ok(&self.buf[..len as usize]);
+                }
+                Err(e) => match e {
+                    // Try increase the buffer size
+                    Error::TooBig => {
+                        // Maximum size reached
+                        if buf_size >= max {
+                            return Err(e);
+                        }
+
+                        buf_size += step;
+                    }
+                    _ => return Err(e),
+                },
+            }
+        }
+    }
+
     /// Rewrite response bytes to given slice.
     pub fn set_response(&self, message: &[u8]) -> Result<(), Error> {
         let res = unsafe {
@@ -87,6 +144,40 @@ impl Request {
             Ok(())
         }
     }
+
+    /// Return the protocol client used to query
+    pub fn protocol(&self) -> Result<Protocol, Error> {
+        let r = to_result(unsafe { host_calls::request_protocol(self.id) })?;
+        Ok(Protocol::from(r))
+    }
+
+    /// Return whether the request is resolved from cache
+    pub fn from_cache(&self) -> Result<bool, Error> {
+        let r = to_result(unsafe { host_calls::request_from_cache(self.id) })?;
+        Ok(r == 1)
+    }
+
+    pub fn elapsed(&self) -> Result<Duration, Error> {
+        let (mut sec, mut nsec) = ([0u8; 8], [0u8; 4]);
+        to_result(unsafe {
+            host_calls::request_elapsed(self.id, sec.as_mut_ptr(), nsec.as_mut_ptr())
+        })?;
+        Ok(Duration::new(
+            u64::from_be_bytes(sec),
+            u32::from_be_bytes(nsec),
+        ))
+    }
+}
+
+/// get current unix timestamp as Duration
+#[inline]
+pub fn timestamp() -> Result<Duration, Error> {
+    let (mut sec, mut nsec) = ([0u8; 8], [0u8; 4]);
+    to_result(unsafe { host_calls::timestamp(sec.as_mut_ptr(), nsec.as_mut_ptr()) })?;
+    Ok(Duration::new(
+        u64::from_be_bytes(sec),
+        u32::from_be_bytes(nsec),
+    ))
 }
 
 /// Prints formatted message on host (if enabled).
@@ -263,8 +354,6 @@ impl LocalStream {
         (self.0).0
     }
 }
-
-
 
 impl AsyncWrite for LocalStream {
     fn poll_write(&mut self, _lw: &Waker, buf: &[u8]) -> Poll<io::Result<usize>> {
@@ -479,6 +568,36 @@ where
     unsafe {
         host_calls::register_on_message(Phase::PreCache as i32, Box::into_raw(wrapped_closure))
     };
+}
+
+#[inline]
+pub fn for_each_message_precache<F>(closure: impl FnMut(Request) -> F + 'static)
+where
+    F: Future<Output = Result<Action, Error>> + 'static,
+{
+    for_each_message_phase(Phase::PreCache, closure)
+}
+
+#[inline]
+pub fn for_each_message_finish<F>(closure: impl FnMut(Request) -> F + 'static)
+where
+    F: Future<Output = Result<Action, Error>> + 'static,
+{
+    for_each_message_phase(Phase::Finish, closure)
+}
+
+fn for_each_message_phase<F>(phase: Phase, mut closure: impl FnMut(Request) -> F + 'static)
+where
+    F: Future<Output = Result<Action, Error>> + 'static,
+{
+    let wrapped_closure = Box::new(move |request_id| {
+        let req = Request {
+            id: request_id,
+            buf: Vec::new(),
+        };
+        schedule_future(closure(req)).into()
+    });
+    unsafe { host_calls::register_on_message(phase as i32, Box::into_raw(wrapped_closure)) };
 }
 
 // Trampoline for exported closures

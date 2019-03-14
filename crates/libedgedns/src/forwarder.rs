@@ -232,7 +232,7 @@ impl Origin for MinLoadOrigin {
         &self.addresses
     }
 
-    fn get_scoped(&self, scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+    fn get_scoped(&self, _scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
         unimplemented!()
     }
 }

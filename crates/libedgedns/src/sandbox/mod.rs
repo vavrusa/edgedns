@@ -20,6 +20,7 @@ use tokio::timer;
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
 mod fsloader;
+mod kvloader;
 mod host_calls;
 mod sandbox;
 pub use sandbox::Sandbox;

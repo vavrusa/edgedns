@@ -1,7 +1,7 @@
 /// Apps loader that loads sandboxed apps from a local directory.
 use crate::context::Context;
 use crate::error::Error;
-use crate::sandbox::{self, sandbox::InstanceMap};
+use crate::sandbox::{sandbox::InstanceMap, sandbox::replace_instance};
 use log::*;
 use std::fs;
 use std::io;
@@ -28,7 +28,7 @@ pub struct FSLoader {
 impl FSLoader {
     /// Creates a new FSLoader instance from the configuration.
     pub fn new<P: AsRef<Path>>(path: P, config: toml::value::Table) -> Self {
-        FSLoader {
+        Self {
             path: path.as_ref().to_path_buf(),
             config,
         }
@@ -75,24 +75,8 @@ impl FSLoader {
                 _ => (),
             }
 
-            // Instantiate the app
-            trace!("reloading app '{}'", filename);
             let data = Self::read_to_end(PathBuf::from(&path))?;
-            let instance = sandbox::instantiate(filename.clone(), &data, context.clone())
-                .map_err(|e| Error::from(format!("{:?}", e).as_str()))?;
-
-            // Replace the previous instance
-            let prev = instances.write().insert(filename, (instance.clone(), time));
-            if let Some((instance, ..)) = prev {
-                instance.cancel();
-            }
-
-            // Start the entrypoint
-            tokio::spawn(sandbox::run(instance).map_err(|e| {
-                if !e.is_cancellation() {
-                    error!("error while running the app: {:?}", e)
-                }
-            }));
+            replace_instance(filename, &data, time, vec![], &instances, context.clone())?;
         }
 
         Ok(())

@@ -11,12 +11,10 @@ use log::*;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use http::Uri;
 use stream_cancel::Tripwire;
 use tokio::await;
 use tokio::net::UdpSocket;
 use tokio::prelude::*;
-use std::str::FromStr;
 
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const PKG_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
@@ -102,7 +100,7 @@ fn main() {
 
 fn runtime_context(path: &Path, name: &str) -> Arc<Context> {
     let mut config = Config::default();
-    config.apps_location = Uri::from_str(path.to_str().unwrap()).ok();
+    config.apps_location = path.to_str().unwrap().parse().ok();
     config.apps_config.insert(name.to_owned(), toml::value::Value::Table(toml::value::Table::new()));
     Context::new(config)
 }

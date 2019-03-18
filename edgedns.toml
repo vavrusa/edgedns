@@ -108,9 +108,15 @@ only_failures = false
 [apps]
 # Global settings for sandbox apps and the loader.
 
-# The location (local path) where apps should be loaded.
+# The location where apps should be loaded.
 # It will look for WASM files that are configured below.
-#location = "/etc/edgedns/apps"
+# Supported schemes are:
+#  * file - load apps from filesystem, the path is expected to be a local path, e.g. `/etc/edgedns/apps`
+#  * memcache - load apps from a memcached instance, the URI accepts following query parameters:
+#    * signing_key - (optional) base64 encoded key to verify app HMAC digests (if not present, all apps will be trusted)
+#    * prefix - (optional) KV store prefix, e.g. if set to `/prefix`, then the manifest file would be at `/prefix/manifest`
+# location = "file:/etc/edgedns/apps"
+# location = "memcache:/tmp/memcache.sock?signing_key=bXlzZWNyZXRrZXk=&prefix=/prefix"
 
 # Enabled app and its configuration.
 #[apps.example]

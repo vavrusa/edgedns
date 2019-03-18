@@ -45,7 +45,8 @@ mod zipkin_tracer {
 
             let (report, worker) = if let Some(ref url) = config.tracing_reporter_url {
                 debug!("configured tracer with reporter: {}", url);
-                let (stream, report) = zipkin_reporter_http::Builder::new(url.clone())
+                let uri = url.as_str().parse().expect("uri conversion");
+                let (stream, report) = zipkin_reporter_http::Builder::new(uri)
                     .concurrency(1)
                     .queue_size(250)
                     .chunk_size(1)

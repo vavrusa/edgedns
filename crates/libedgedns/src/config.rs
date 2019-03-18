@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::forwarder::LoadBalancingMode;
-use http::Uri;
+use url::Url;
 use log::*;
 use native_tls::{Identity, TlsAcceptor};
 use std::convert::TryFrom;
@@ -126,10 +126,10 @@ pub struct Config {
     pub max_clients_waiting_for_query: usize,
     pub max_upstream_connections: usize,
     pub tracing_enabled: bool,
-    pub tracing_reporter_url: Option<Uri>,
+    pub tracing_reporter_url: Option<Url>,
     pub tracing_sampling_rate: f64,
     pub tracing_only_failures: bool,
-    pub apps_location: Option<Uri>,
+    pub apps_location: Option<Url>,
     pub apps_config: toml::value::Table,
 }
 
@@ -401,7 +401,7 @@ impl Config {
 
         let tracing_reporter_url = config_tracing.and_then(|x| x.get("reporter_url")).map(|x| {
             let uri = x.as_str().expect("tracing.reporter_url must be a string");
-            Uri::from_str(uri).expect("tracing.reporter_url must be a valid URI")
+            Url::parse(uri).expect("tracing.reporter_url must be a valid URI")
         });
 
         let tracing_sampling_rate = config_tracing
@@ -421,7 +421,7 @@ impl Config {
         let config_apps = toml_config.get("apps");
         let apps_location = config_apps.and_then(|x| x.get("location")).map(|x| {
             let uri = x.as_str().expect("apps.location must be a string");
-            Uri::from_str(uri).expect("apps.location must be a valid URI")
+            Url::parse(uri).expect("apps.location must be a valid URI")
         });
 
         let apps_config = match config_apps {

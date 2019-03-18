@@ -1,8 +1,9 @@
 /// Loader for sandboxed applications.
 use crate::config::Config;
 use crate::context::Context;
+use crate::error::Error;
 use crate::query_router::Scope;
-use crate::sandbox::{self, fsloader::FSLoader, Instance};
+use crate::sandbox::{self, fsloader::FSLoader, kvloader::KVLoader, Instance};
 use bytes::BytesMut;
 use guest_types as guest;
 use log::*;
@@ -13,13 +14,15 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use stream_cancel::Tripwire;
 use tokio::await;
+use tokio::prelude::*;
 
 /// Map of named guest app instances.
-pub type InstanceMap = Arc<RwLock<HashMap<String, (Instance, SystemTime)>>>;
+pub type InstanceMap = Arc<RwLock<HashMap<String, (Instance, SystemTime, Vec<u8>)>>>;
 
 /// Generic loader interface.
 enum Loader {
     FS(Arc<FSLoader>),
+    KV(Arc<KVLoader>),
 }
 
 /// Interface for the guest app sandbox.
@@ -32,14 +35,18 @@ pub struct Sandbox {
 impl Sandbox {
     /// Spawns a async background reloader.
     pub fn start(&self, context: Arc<Context>, cancel: Tripwire) {
+        // Load immediately on startup
         match self.loader {
             Some(Loader::FS(ref loader)) => {
-                // Load immediately on startup
                 if let Err(e) = loader.load(&self.instances, &context) {
                     error!("failed to load apps: {:?}", e);
                 }
                 let instances = self.instances.clone();
                 tokio::spawn_async(FSLoader::start(loader.clone(), instances, context, cancel))
+            }
+            Some(Loader::KV(ref loader)) => {
+                let instances = self.instances.clone();
+                tokio::spawn_async(KVLoader::start(loader.clone(), instances, context, cancel))
             }
             None => {}
         }
@@ -57,7 +64,7 @@ impl Sandbox {
             .instances
             .read()
             .values()
-            .map(|(x, _)| x.clone())
+            .map(|(x, _, _)| x.clone())
             .collect();
         trace!("resolving phase {:?}", phase);
         for instance in instances.iter() {
@@ -90,15 +97,19 @@ impl Drop for Sandbox {
 impl From<&Arc<Config>> for Sandbox {
     fn from(config: &Arc<Config>) -> Self {
         let loader = match config.apps_location {
-            Some(ref uri) => match uri.scheme_str() {
-                Some("file") | None => {
+            Some(ref uri) => match uri.scheme() {
+                "file" => {
                     let path = Path::new(uri.path());
                     Some(Loader::FS(Arc::new(FSLoader::new(
                         path,
                         config.apps_config.clone(),
                     ))))
                 }
-                _ => panic!("location scheme {:?} not supported", uri.scheme_str()),
+                "memcache" => Some(Loader::KV(Arc::new(KVLoader::new(
+                    uri.clone(),
+                    config.apps_config.clone(),
+                )))),
+                _ => panic!("location scheme {:?} not supported", uri.scheme()),
             },
             None => None,
         };
@@ -108,4 +119,36 @@ impl From<&Arc<Config>> for Sandbox {
             instances: InstanceMap::default(),
         }
     }
+}
+
+/// Replaces the previous app instance in the InstanceMap with a new instance.
+pub(crate) fn replace_instance(
+    key: String,
+    data: &[u8],
+    now: SystemTime,
+    signature: Vec<u8>,
+    instances: &InstanceMap,
+    context: Arc<Context>,
+) -> Result<(), Error> {
+    // Instantiate the app
+    trace!("reloading app {} ({}B)", key, data.len());
+    let instance = sandbox::instantiate(key.clone(), data, context)
+        .map_err(|e| Error::from(format!("{:?}", e).as_str()))?;
+
+    // Replace the previous instance
+    let prev = instances
+        .write()
+        .insert(key, (instance.clone(), now, signature));
+    if let Some((instance, ..)) = prev {
+        instance.cancel();
+    }
+
+    // Start the entrypoint
+    tokio::spawn(sandbox::run(instance).map_err(|e| {
+        if !e.is_cancellation() {
+            error!("error while running the app: {:?}", e)
+        }
+    }));
+
+    Ok(())
 }

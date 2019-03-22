@@ -55,7 +55,7 @@ impl Inner {
             uptime: register_gauge!(opts!(
                 "edgedns_uptime",
                 "Uptime",
-                labels! {"handler" => "all",}
+                labels! {"version" => env!("CARGO_PKG_VERSION"), }
             ))
             .unwrap(),
             cache_frequent_len: register_gauge!(opts!(

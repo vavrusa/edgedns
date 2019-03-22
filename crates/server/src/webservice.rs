@@ -1,11 +1,13 @@
 //! Expose metrics via the Prometheus API
+use hyper::error::Error;
 use hyper::rt::Future;
 use hyper::service::service_fn_ok;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use libedgedns::Context;
-use log::*;
+use log::info;
 use prometheus;
 use prometheus::{Encoder, TextEncoder};
+use std::net::TcpListener;
 use std::sync::Arc;
 use stream_cancel::Tripwire;
 use tokio::executor::DefaultExecutor;
@@ -14,16 +16,28 @@ use tokio::executor::DefaultExecutor;
 pub struct WebService {}
 
 impl WebService {
-    pub fn spawn(context: Arc<Context>, tripwire: Tripwire) {
+    pub fn spawn(context: Arc<Context>, tripwire: Tripwire) -> Result<(), Error> {
         let config = &context.config;
         if !config.webservice_enabled {
-            return;
+            return Ok(());
         }
 
-        let listen_addr = config
-            .webservice_listen_addr
-            .parse()
-            .expect("Unsupport listen address for the prometheus service");
+        let listen_addr = config.webservice_listen_addr;
+        let listener = TcpListener::bind(listen_addr).expect("bind to webservice.listen_addr");
+        info!("webservice bound to {}", listen_addr);
+
+        Self::spawn_listener(context, listener, tripwire)
+    }
+
+    pub fn spawn_listener(
+        context: Arc<Context>,
+        listener: TcpListener,
+        tripwire: Tripwire,
+    ) -> Result<(), Error> {
+        let config = &context.config;
+        if !config.webservice_enabled {
+            return Ok(());
+        }
 
         let new_service = move || {
             let context = context.clone();
@@ -75,15 +89,14 @@ impl WebService {
             })
         };
 
-        let server = Server::bind(&listen_addr)
+        let server = Server::from_tcp(listener)?
             .executor(DefaultExecutor::current())
             .serve(new_service)
             .with_graceful_shutdown(tripwire)
             .map_err(|e| eprintln!("server error: {}", e));
 
-        tokio::spawn(server.then(|_| {
-            info!("webserver done");
-            Ok(())
-        }));
+        tokio::spawn(server.then(|_| Ok(())));
+
+        Ok(())
     }
 }

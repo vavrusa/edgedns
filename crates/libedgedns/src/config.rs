@@ -112,7 +112,7 @@ pub struct Config {
     pub cache_size: usize,
     pub listen: Vec<Arc<Listener>>,
     pub webservice_enabled: bool,
-    pub webservice_listen_addr: String,
+    pub webservice_listen_addr: SocketAddr,
     pub min_ttl: u32,
     pub max_ttl: u32,
     pub user: Option<String>,
@@ -144,7 +144,7 @@ impl Default for Config {
             cache_size: 250_000,
             listen: vec![Arc::new(Listener::try_from("0.0.0.0:53").unwrap())],
             webservice_enabled: false,
-            webservice_listen_addr: "0.0.0.0:9090".to_string(),
+            webservice_listen_addr: "0.0.0.0:9090".parse().unwrap(),
             min_ttl: 1,
             max_ttl: 86_400,
             user: None,
@@ -316,7 +316,8 @@ impl Config {
             .map_or("0.0.0.0:9090", |x| {
                 x.as_str().expect("webservice.listen_addr must be a string")
             })
-            .to_owned();
+            .parse()
+            .expect("webservice.listen_addr must be a valid address");
 
         let config_global = toml_config.get("global");
 

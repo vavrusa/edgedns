@@ -1,7 +1,7 @@
 use crate::cache::CacheKey;
 use crate::codecs::*;
 use crate::config::Config;
-use crate::query_router::Scope;
+use crate::query_router::ClientRequest;
 use crate::tracing;
 use crate::varz;
 use clockpro_cache::*;
@@ -61,7 +61,7 @@ pub trait Origin: Send + Sync {
     fn get(&self) -> &[SocketAddr];
 
     /// Returns a selection of addresses for given scope.
-    fn get_scoped(&self, _scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+    fn get_scoped(&self, _scope: &ClientRequest, _timetable: &Timetable) -> Vec<SocketAddr> {
         self.get().to_vec()
     }
 
@@ -71,7 +71,7 @@ pub trait Origin: Send + Sync {
     }
 
     /// Convenience function to return next selected address.
-    fn choose(&self, _scope: &Scope) -> Option<&SocketAddr> {
+    fn choose(&self, _scope: &ClientRequest) -> Option<&SocketAddr> {
         self.get().first()
     }
 }
@@ -94,7 +94,7 @@ impl Conductor {
     /// Resolve a query with given origin, and wait for response.
     pub fn resolve(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         query: Message,
         origin: Arc<Origin>,
     ) -> impl Future<Item = (Message, SocketAddr), Error = IoError> {
@@ -151,7 +151,7 @@ type ExchangeFuture = Box<Future<Item = (Message, SocketAddr), Error = IoError> 
 trait Exchanger: Send + Sync {
     fn exchange(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         query: Message,
         origin: Arc<Origin>,
         pending: &PendingQuery,
@@ -169,7 +169,7 @@ pub struct Timetable {
 impl Timetable {
     /// Register a query identified by `key` as pending, and add `sink` to the queue of waiting futures.
     /// Note: The function returns a handle that closes when the pending query when it goes out of scope.
-    fn start_query(&self, scope: &Scope, key: &CacheKey) -> Option<PendingQuery> {
+    fn start_query(&self, scope: &ClientRequest, key: &CacheKey) -> Option<PendingQuery> {
         if self.pending.start(&key) {
             Some(PendingQuery::new(key.clone(), self.pending.clone(), scope))
         } else {
@@ -245,7 +245,7 @@ struct PendingQuery {
 }
 
 impl PendingQuery {
-    fn new(key: CacheKey, context: Arc<PendingQueries>, scope: &Scope) -> Self {
+    fn new(key: CacheKey, context: Arc<PendingQueries>, scope: &ClientRequest) -> Self {
         let varz = varz::current();
         varz.upstream_inflight_queries.inc();
         let _timer = varz.upstream_rtt.start_timer();
@@ -436,7 +436,7 @@ struct AnyExchanger {
 impl Exchanger for AnyExchanger {
     fn exchange(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         query: Message,
         origin: Arc<Origin>,
         pending: &PendingQuery,
@@ -567,7 +567,7 @@ struct NoopExchanger {
 impl Exchanger for NoopExchanger {
     fn exchange(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         query: Message,
         origin: Arc<Origin>,
         _pending: &PendingQuery,
@@ -1142,7 +1142,7 @@ fn exchange_with_udp(
 #[cfg(test)]
 mod test {
     use super::{Builder, Conductor, Retransmitter};
-    use crate::query_router::Scope;
+    use crate::query_router::ClientRequest;
     use crate::test_utils::{test_echo_server, TestOrigin, DOMAINS};
     use bytes::Bytes;
     use domain_core::bits::*;
@@ -1232,7 +1232,7 @@ mod test {
         // Create a test set
         let test_set = (0..1000).map(move |i| {
             let msg = messages[i % messages.len()].clone();
-            let scope = Scope::new(msg.clone().as_bytes().clone(), peer_addr).unwrap();
+            let scope = ClientRequest::new(msg.clone().as_bytes().clone(), peer_addr).unwrap();
             conductor
                 .resolve(&scope, msg, origin.clone())
                 .then(move |res| {

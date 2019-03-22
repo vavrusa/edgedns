@@ -5,8 +5,8 @@ use bytes::BytesMut;
 use clap::{App, Arg};
 use domain_core::bits::*;
 use env_logger;
-use guest;
-use libedgedns::{Config, Context, FramedStream, Scope, sandbox::Sandbox};
+use guest_types as guest;
+use libedgedns::{Config, Context, FramedStream, ClientRequest, sandbox::Sandbox};
 use log::*;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -69,7 +69,7 @@ fn main() {
 
                 let (mut sink, mut stream) = FramedStream::from(socket).split();
                 while let Some(Ok((msg, from))) = await!(stream.next()) {
-                    let mut scope = Scope::new(msg.clone().into(), from).expect("scope");
+                    let mut scope = ClientRequest::new(msg.clone().into(), from).expect("scope");
                     scope.set_local_addr(local_addr.clone(), false);
                     trace!("processing {} bytes from {}", msg.len(), from);
 

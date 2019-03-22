@@ -2,7 +2,7 @@ use crate::codecs::*;
 use crate::config::Listener;
 use crate::context::Context;
 use crate::error::Result;
-use crate::query_router::{QueryRouter, Scope};
+use crate::query_router::{ClientRequest, QueryRouter};
 use bytes::{Bytes, BytesMut};
 use futures::sync::mpsc;
 use guest_types::Protocol;
@@ -223,7 +223,12 @@ impl Server {
             async move {
                 trace!("stream client {} processing", peer_addr);
                 await!(Self::stream_process_concurrent(
-                    router, stream, tx, rx, local_endpoint, cancel,
+                    router,
+                    stream,
+                    tx,
+                    rx,
+                    local_endpoint,
+                    cancel,
                 ));
 
                 // Client disconnected, remove the associated connection and close the
@@ -266,7 +271,12 @@ impl Server {
 
         // Spawn TCP acceptors
         let socket = TcpListener::bind(&addr)?;
-        self.spawn_stream_tcp(router.clone(), socket, local_endpoint.clone(), cancel.clone());
+        self.spawn_stream_tcp(
+            router.clone(),
+            socket,
+            local_endpoint.clone(),
+            cancel.clone(),
+        );
 
         // Spawn a single concurrent handler with higher overhead, and the rest of fast-lane handlers.
         // This serves two purposes:
@@ -276,7 +286,12 @@ impl Server {
         //    requests per second during heavy load.
         let socket = create_udp_socket(addr)?;
         let stream = udp_socket_from(socket.try_clone()?)?;
-        self.spawn_stream_udp(router.clone(), stream, local_endpoint.clone(), cancel.clone());
+        self.spawn_stream_udp(
+            router.clone(),
+            stream,
+            local_endpoint.clone(),
+            cancel.clone(),
+        );
 
         let stream = FramedStream::from(udp_socket_from(socket)?);
         tokio::spawn_async(Self::stream_process_sequential(
@@ -290,7 +305,13 @@ impl Server {
     }
 
     /// Spawns a UDP processor on the server.
-    pub fn spawn_stream_udp(&self, query_router: Arc<QueryRouter>, stream: UdpSocket, local_endpoint: Arc<Listener>, cancel: Tripwire) {
+    pub fn spawn_stream_udp(
+        &self,
+        query_router: Arc<QueryRouter>,
+        stream: UdpSocket,
+        local_endpoint: Arc<Listener>,
+        cancel: Tripwire,
+    ) {
         let stream = FramedStream::from(stream);
         let (tx, rx) = mpsc::channel(CONCURRENT_QUEUE_SIZE);
         tokio::spawn_async(Self::stream_process_concurrent(
@@ -304,7 +325,13 @@ impl Server {
     }
 
     /// Spawns a TCP listener on the server.
-    pub fn spawn_stream_tcp(&self, query_router: Arc<QueryRouter>, listener: TcpListener, local_endpoint: Arc<Listener>, cancel: Tripwire) {
+    pub fn spawn_stream_tcp(
+        &self,
+        query_router: Arc<QueryRouter>,
+        listener: TcpListener,
+        local_endpoint: Arc<Listener>,
+        cancel: Tripwire,
+    ) {
         let tls_acceptor = match local_endpoint.tls {
             Some(ref tls) => Some(TlsAcceptor::from(tls.clone())),
             None => None,
@@ -312,48 +339,79 @@ impl Server {
 
         let context = self.context.clone();
         let connections = self.connections.clone();
-        tokio::spawn_async(async move {
-            let mut incoming = listener.incoming().take_until(cancel.clone());
-            while let Some(item) = await!(incoming.next()) {
-                // Check if the next client can be accepted
-                let stream = match item {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!("can't accept stream client, err {:?}", e);
-                        continue;
-                    }
-                };
-
-                let peer_addr = stream.peer_addr().expect("tcp peer has address");
-                trace!("stream client {} connected", peer_addr);
-
-                // Perform the optional TLS handshake
-                let stream = match tls_acceptor {
-                    Some(ref tls_acceptor) => match await!(tls_acceptor.clone().accept(stream)) {
-                        Ok(stream) => FramedStream::from(stream),
+        tokio::spawn_async(
+            async move {
+                let mut incoming = listener.incoming().take_until(cancel.clone());
+                while let Some(item) = await!(incoming.next()) {
+                    // Check if the next client can be accepted
+                    let stream = match item {
+                        Ok(stream) => stream,
                         Err(e) => {
-                            warn!("TLS handshake failed, err {:?}", e);
+                            warn!("can't accept stream client, err {:?}", e);
                             continue;
                         }
-                    },
-                    None => FramedStream::from(stream),
-                };
+                    };
 
-                Self::stream_start_client(
-                    &context,
-                    query_router.clone(),
-                    connections.clone(),
-                    stream,
-                    peer_addr,
-                    local_endpoint.clone(),
-                    cancel.clone(),
-                );
-            }
-        });
+                    // Shortand for both TlsStream and TcpStream
+                    macro_rules! maybe_proxy {
+                        ($x:ident, $endpoint:ident) => {
+                            if $endpoint.proxy_protocol {
+                                await!(read_proxy_preface($x)).map(|(stream, peer, _local)| FramedStream::from((stream, peer)))
+                            } else {
+                                Ok(FramedStream::from($x))
+                            }
+                        };
+                    }
+
+                    // Perform the optional TLS handshake
+                    let stream = match tls_acceptor {
+                        Some(ref tls_acceptor) => match await!(tls_acceptor.clone().accept(stream))
+                        {
+                            Ok(stream) => match maybe_proxy!(stream, local_endpoint) {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    warn!("Failed to parse proxy protocol header: {}", e);
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                warn!("TLS handshake failed, err {:?}", e);
+                                continue;
+                            }
+                        },
+                        None => match maybe_proxy!(stream, local_endpoint) {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    warn!("Failed to parse proxy protocol header: {}", e);
+                                    continue;
+                                }
+                            }
+                    };
+
+                    let peer_addr = stream.peer_addr().expect("tcp peer has address");
+                    trace!("stream client {} connected", stream.peer_addr().expect("tcp peer has address"));
+                    Self::stream_start_client(
+                        &context,
+                        query_router.clone(),
+                        connections.clone(),
+                        stream,
+                        peer_addr,
+                        local_endpoint.clone(),
+                        cancel.clone(),
+                    );
+                }
+            },
+        );
     }
 
     /// Spawns a UNIX listener on the server.
-    pub fn spawn_stream_unix(&self, _query_router: Arc<QueryRouter>, _listener: UnixListener, _local_endpoint: Arc<Listener>, _cancel: Tripwire) {
+    pub fn spawn_stream_unix(
+        &self,
+        _query_router: Arc<QueryRouter>,
+        _listener: UnixListener,
+        _local_endpoint: Arc<Listener>,
+        _cancel: Tripwire,
+    ) {
         unimplemented!()
     }
 }
@@ -368,7 +426,7 @@ async fn resolve_message<'a>(
     local_endpoint: &'a Arc<Listener>,
 ) -> Result<(BytesMut, SocketAddr)> {
     // Create a new request scope
-    let result = match Scope::new(msg, from) {
+    let result = match ClientRequest::new(msg, from) {
         Ok(mut scope) => {
             scope.set_protocol(protocol);
             scope.set_local_addr(local_address, local_endpoint.internal);

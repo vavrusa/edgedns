@@ -396,7 +396,7 @@ dependencies = [
  "clap 2.32.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "domain-core 0.4.1 (git+https://github.com/vavrusa/domain-core?rev=0e22a1718048ac0c9498fbe0001cd6677cadcfd7)",
  "env_logger 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "guest 0.1.0",
+ "guest-types 0.1.0",
  "http 0.1.16 (registry+https://github.com/rust-lang/crates.io-index)",
  "libedgedns 0.4.0",
  "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",

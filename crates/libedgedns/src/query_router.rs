@@ -26,7 +26,7 @@ lazy_static! {
     static ref DNAME_SERVER: Dname = Dname::from_str("server.").unwrap();
 }
 
-/// A request scope is a handle and state for a single client request.
+/// A client request is a handle and state for a single client request.
 /// It keeps the client query and source information, as well as a reference
 /// to the context on which it was created.
 ///
@@ -36,7 +36,7 @@ lazy_static! {
 /// use domain_core::bits::{Dname, Question, SectionBuilder, MessageBuilder};
 /// use domain_core::iana::{Rtype, Class};
 /// use bytes::{Bytes, BytesMut};
-/// use libedgedns::{Config, Context, QueryRouter, Scope};
+/// use libedgedns::{Config, Context, QueryRouter, ClientRequest};
 ///
 /// let context = Context::new(Config::default());
 /// let router = QueryRouter::new(context.clone());
@@ -46,13 +46,13 @@ lazy_static! {
 ///    mb.finish().into()
 /// };
 ///
-/// let scope = Scope::new(query, "127.0.0.1:53".parse().unwrap()).expect("scope");
+/// let scope = ClientRequest::new(query, "127.0.0.1:53".parse().unwrap()).expect("scope");
 /// tokio::run_async(async move {
 ///     println!("result: {:?}", await!(router.resolve(scope, BytesMut::new())));
 /// });
 ///
 /// ```
-pub struct Scope {
+pub struct ClientRequest {
     pub query: Message,
     pub question: Question<ParsedDname>,
     pub peer_addr: SocketAddr,
@@ -64,7 +64,7 @@ pub struct Scope {
     pub start_time: Instant,
 }
 
-impl Clone for Scope {
+impl Clone for ClientRequest {
     fn clone(&self) -> Self {
         Self {
             query: self.query.clone(),
@@ -80,7 +80,7 @@ impl Clone for Scope {
     }
 }
 
-impl Scope {
+impl ClientRequest {
     /// Creates a new request scope with starting query.
     pub fn new(query: Bytes, peer_addr: SocketAddr) -> Result<Self> {
         let query = Message::from_bytes(query).unwrap();
@@ -128,7 +128,7 @@ impl Scope {
     }
 }
 
-impl Drop for Scope {
+impl Drop for ClientRequest {
     fn drop(&mut self) {
         varz::current().inflight_queries.dec();
     }
@@ -196,7 +196,7 @@ impl QueryRouter {
     }
 
     /// Resolve the DNS request and serialize the answer in provided buffer.
-    pub async fn resolve(&self, mut scope: Scope, answer: BytesMut) -> Result<BytesMut> {
+    pub async fn resolve(&self, mut scope: ClientRequest, answer: BytesMut) -> Result<BytesMut> {
         // Update metrics
         let varz = varz::current();
         varz.client_queries.inc();
@@ -295,7 +295,7 @@ impl QueryRouter {
 
     fn resolve_from_answer(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         source: Message,
         answer: BytesMut,
         elapsed: Option<u32>,
@@ -381,7 +381,7 @@ impl QueryRouter {
     /// Resolve from cached entry.
     fn resolve_from_cache(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         entry: CacheEntry,
         answer: BytesMut,
     ) -> Result<BytesMut> {
@@ -391,7 +391,7 @@ impl QueryRouter {
     }
 
     /// Fallback handler to resolve CHAOS zone requests
-    fn resolve_to_chaos(&self, scope: &Scope, answer: BytesMut) -> Result<BytesMut> {
+    fn resolve_to_chaos(&self, scope: &ClientRequest, answer: BytesMut) -> Result<BytesMut> {
         // Fallback handler only implements CH TXT
         if scope.question.qtype() != Rtype::Txt {
             return self.resolve_to_error(scope, answer, Rcode::NotImp, false);
@@ -439,7 +439,7 @@ impl QueryRouter {
     /// Fallback handler to resolve errors into error responses
     fn resolve_to_error(
         &self,
-        scope: &Scope,
+        scope: &ClientRequest,
         answer: BytesMut,
         rcode: Rcode,
         truncated: bool,
@@ -463,7 +463,7 @@ impl QueryRouter {
 
 #[cfg(test)]
 mod test {
-    use super::{QueryRouter, Scope};
+    use super::{QueryRouter, ClientRequest};
     use crate::test_utils::{test_context, DOMAINS};
     use bytes::{Bytes, BytesMut};
     use domain_core::bits::*;
@@ -494,7 +494,7 @@ mod test {
             tokio::run_async(
                 async move {
                     for i in 1..1000 {
-                        let scope = Scope::new(messages[i - 1].clone(), peer_addr).unwrap();
+                        let scope = ClientRequest::new(messages[i - 1].clone(), peer_addr).unwrap();
                         let mut buf = buf.clone();
                         buf.reserve(512);
                         black_box(await!(router.resolve(scope, buf)).expect("result"));

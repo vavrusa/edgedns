@@ -3,7 +3,7 @@ use crate::conductor::{Origin, Timetable};
 use crate::config::Config;
 use crate::context::Context;
 use crate::forwarder::{Forwarder, LoadBalancingMode};
-use crate::query_router::Scope;
+use crate::query_router::ClientRequest;
 use crate::HEALTH_CHECK_MS;
 use bytes::Bytes;
 use domain_core::bits::*;
@@ -127,7 +127,7 @@ impl Recursor {
 
         // Poll root servers for healthcheck
         while let Some(_) = await!(interval.next()) {
-            let scope = Scope::new(msg.clone(), source).unwrap();
+            let scope = ClientRequest::new(msg.clone(), source).unwrap();
             let start = Instant::now();
             match await!(self.resolve(&context, &scope)) {
                 Ok(msg) => {
@@ -150,7 +150,7 @@ impl Recursor {
     pub async fn resolve<'a>(
         &'a self,
         context: &'a Arc<Context>,
-        scope: &'a Scope,
+        scope: &'a ClientRequest,
     ) -> Result<Message> {
         // See if the request should be forwarded or resolved locally
         // Requests arriving on an internal interface are never forwarded to avoid loops
@@ -315,7 +315,7 @@ impl Origin for PreferenceList {
         &self.addresses
     }
 
-    fn get_scoped(&self, _scope: &Scope, timetable: &Timetable) -> Vec<SocketAddr> {
+    fn get_scoped(&self, _scope: &ClientRequest, timetable: &Timetable) -> Vec<SocketAddr> {
         let mut list = self.get().to_vec();
 
         // TODO: sort by metrics from conductor instead of relying on the library
@@ -391,7 +391,7 @@ impl Builder {
 #[cfg(test)]
 mod test {
     use super::Builder;
-    use crate::query_router::Scope;
+    use crate::query_router::ClientRequest;
     use crate::test_utils::test_context;
     use bytes::Bytes;
     use domain_core::bits::*;
@@ -427,7 +427,7 @@ mod test {
             tokio::run_async(
                 async move {
                     for _ in 1..1000 {
-                        let scope = Scope::new(msg.clone(), peer_addr).unwrap();
+                        let scope = ClientRequest::new(msg.clone(), peer_addr).unwrap();
                         black_box(await!(rec.resolve(&context, &scope)).expect("result"));
                     }
                 },

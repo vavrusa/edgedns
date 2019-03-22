@@ -1,7 +1,7 @@
 use crate::conductor::{Origin, Timetable};
 use crate::config::Config;
 use crate::context::Context;
-use crate::query_router::Scope;
+use crate::query_router::ClientRequest;
 use crate::UPSTREAM_TOTAL_TIMEOUT_MS;
 use domain_core::bits::Message;
 use jumphash::JumpHasher;
@@ -51,7 +51,7 @@ impl Forwarder {
     pub fn resolve(
         &self,
         context: &Arc<Context>,
-        scope: &Scope,
+        scope: &ClientRequest,
     ) -> impl Future<Item = Message, Error = Error> {
         let conductor = context.conductor.clone();
         conductor
@@ -170,11 +170,11 @@ impl Origin for UniformlyDistributedOrigin {
         &self.addresses
     }
 
-    fn get_scoped(&self, _scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+    fn get_scoped(&self, _scope: &ClientRequest, _timetable: &Timetable) -> Vec<SocketAddr> {
         self.addresses.choose_multiple(&mut thread_rng(), 4).cloned().collect()
     }
 
-    fn choose(&self, _scope: &Scope) -> Option<&SocketAddr> {
+    fn choose(&self, _scope: &ClientRequest) -> Option<&SocketAddr> {
         self.addresses.choose(&mut thread_rng())
     }
 }
@@ -194,7 +194,7 @@ impl JumpHashOrigin {
     }
 
     /// Returns a slot choice for given scope.
-    fn slot(&self, scope: &Scope) -> usize {
+    fn slot(&self, scope: &ClientRequest) -> usize {
         self
             .jumphasher
             .slot(scope.question.qname(), self.addresses.len() as u32) as usize
@@ -206,12 +206,12 @@ impl Origin for JumpHashOrigin {
         &self.addresses
     }
 
-    fn get_scoped(&self, scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+    fn get_scoped(&self, scope: &ClientRequest, _timetable: &Timetable) -> Vec<SocketAddr> {
         let slot = self.slot(scope);
         (&self.addresses[slot..]).to_vec()
     }
 
-    fn choose(&self, scope: &Scope) -> Option<&SocketAddr> {
+    fn choose(&self, scope: &ClientRequest) -> Option<&SocketAddr> {
         self.addresses.get(self.slot(scope))
     }
 }
@@ -232,7 +232,7 @@ impl Origin for MinLoadOrigin {
         &self.addresses
     }
 
-    fn get_scoped(&self, _scope: &Scope, _timetable: &Timetable) -> Vec<SocketAddr> {
+    fn get_scoped(&self, _scope: &ClientRequest, _timetable: &Timetable) -> Vec<SocketAddr> {
         unimplemented!()
     }
 }
@@ -240,7 +240,7 @@ impl Origin for MinLoadOrigin {
 #[cfg(test)]
 mod test {
     use super::{Builder, LoadBalancingMode};
-    use crate::query_router::Scope;
+    use crate::query_router::ClientRequest;
     use crate::test_utils::{test_context, test_echo_server};
     use bytes::Bytes;
     use domain_core::bits::*;
@@ -281,7 +281,7 @@ mod test {
                 let context = context.clone();
                 let forwarder = forwarder.clone();
                 let set = (0..1000).map(move |_| {
-                    let scope = Scope::new(msg.clone(), peer_addr).unwrap();
+                    let scope = ClientRequest::new(msg.clone(), peer_addr).unwrap();
                     forwarder
                         .resolve(&context, &scope)
                         .and_then(|_| Ok(()))

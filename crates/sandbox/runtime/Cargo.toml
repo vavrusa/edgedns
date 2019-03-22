@@ -18,6 +18,6 @@ toml = "0.4"
 tokio = {version = "0.1.16", features=["async-await-preview"]}
 domain-core = {git = "https://github.com/vavrusa/domain-core", rev = "0e22a1718048ac0c9498fbe0001cd6677cadcfd7"}
 stream-cancel = "0.4"
-guest = {path = "../guest", default-features = false}
+guest-types = {path = "../guest-types", default-features = false}
 libedgedns = {path = "../../libedgedns"}
 http = "0.1"

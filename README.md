@@ -36,6 +36,12 @@ For development, you can use systemfd for socket activation on code change:
 1. cargo install cargo-watch systemfd
 2. systemfd --no-pid -s tcp::1053 -s udp::1053 -- cargo watch -x 'run --bin edgedns -- --config edgedns.toml'
 
+For terminating HTTPS/TLS behind a reverse proxy you can use the provided docker compose.
+Your config should have `proxy_protocol` enabled for `network.listen`.
+
+1. docker-compose up
+2. kdig @127.0.0.1 -p 8853 +tls google.com
+
 On Linux, you may use that
 [sample systemd service](https://github.com/jedisct1/edgedns/blob/master/edgedns.service)
 to start it.

@@ -17,7 +17,7 @@
 //! previously unknown queries is observed.
 
 use crate::config::Config;
-use crate::query_router::Scope;
+use crate::query_router::ClientRequest;
 use bytes::Bytes;
 use clockpro_cache::*;
 use coarsetime::{Duration, Instant};
@@ -33,7 +33,7 @@ use std::u32;
 /// Default TTL for empty responses
 const CACHE_DEFAULT_TTL: u32 = 5;
 
-/// A cache key is a normalized representation of [`Scope`], by default a DNS question.
+/// A cache key is a normalized representation of [`ClientRequest`], by default a DNS question.
 /// Domain name order is determined according to the ‘canonical DNS
 /// name order’ as defined in [section 6.1 of RFC 4034][RFC4034-6.1], and is case insensitive.
 ///
@@ -96,8 +96,8 @@ impl From<&Message> for CacheKey {
     }
 }
 
-impl From<&Scope> for CacheKey {
-    fn from(scope: &Scope) -> Self {
+impl From<&ClientRequest> for CacheKey {
+    fn from(scope: &ClientRequest) -> Self {
         let q = &scope.question;
         Self {
             qname: q.qname().to_name(),

@@ -2,7 +2,7 @@
 use crate::config::Config;
 use crate::context::Context;
 use crate::error::Error;
-use crate::query_router::Scope;
+use crate::query_router::ClientRequest;
 use crate::sandbox::{self, fsloader::FSLoader, kvloader::KVLoader, Instance};
 use bytes::BytesMut;
 use guest_types as guest;
@@ -56,7 +56,7 @@ impl Sandbox {
     pub async fn resolve<'a>(
         &'a self,
         phase: guest::Phase,
-        scope: &'a Scope,
+        scope: &'a ClientRequest,
         mut answer: BytesMut,
     ) -> (BytesMut, guest::Action) {
         let mut action = guest::Action::Pass;

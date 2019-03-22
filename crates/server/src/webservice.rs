@@ -79,6 +79,18 @@ impl WebService {
                         *response.body_mut() = Body::from(buffer);
                     }
 
+                    // Serve DNS over HTTPS
+                    (&Method::GET, "/dns-query") => {
+                        *response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+                        *response.body_mut() = Body::from("NYI GET");
+                    },
+
+                    // Serve DNS over HTTPS
+                    (&Method::POST, "/dns-query") => {
+                        *response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
+                        *response.body_mut() = Body::from("NYI POST");
+                    },
+
                     // The 404 Not Found route...
                     _ => {
                         *response.status_mut() = StatusCode::NOT_FOUND;

@@ -31,13 +31,14 @@ max_ttl = 86400
 
 
 [network]
-# Listen address (can be a single address, or an table of named listeners)
-
-# For example, an additional TLS interface would be configured as:
+# Listen address (can be a single address, or a table of named listeners)
 #
 # [[network.listen]]
 # address = "0.0.0.0:53"
 # internal = true
+# proxy_protocol = false
+
+# For example, an additional TLS interface would be configured as:
 #
 # [[network.listen]]
 # address = "0.0.0.0:853"
@@ -45,7 +46,7 @@ max_ttl = 86400
 
 [webservice]
 # Change to `true` in order to start the webservice
-enabled = false
+enabled = true
 
 # Webservice address for Prometheus. Path will be /metrics
 listen = "0.0.0.0:9090"

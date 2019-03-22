@@ -1,4 +1,4 @@
-use crate::{Context, Scope};
+use crate::{Context, ClientRequest};
 use bytes::BytesMut;
 use core::ffi::c_void;
 use domain_core::bits::Message;
@@ -134,7 +134,7 @@ pub fn run(instance: Instance) -> impl Future<Item = (), Error = CallError> {
 pub fn run_hook(
     instance: &Instance,
     phase: guest::Phase,
-    scope: &Scope,
+    scope: &ClientRequest,
     answer: BytesMut,
 ) -> impl Future<Item = (BytesMut, guest::Action), Error = CallError> {
     // Check if callback is installed
@@ -223,7 +223,7 @@ impl InstanceWrapper {
 
 /// Execution state for each client request.
 /// This allows storing state for per-request guest futures.
-type RequestState = (Scope, BytesMut);
+type RequestState = (ClientRequest, BytesMut);
 
 /// Indirect reference to guest installed callback.
 #[derive(Clone, Copy, Default)]
@@ -305,7 +305,7 @@ impl GuestFuture {
     }
 
     /// Associate the future with the host request, the guest future takes ownership of the request.
-    fn with_request(mut self, scope: &Scope, answer: BytesMut) -> Self {
+    fn with_request(mut self, scope: &ClientRequest, answer: BytesMut) -> Self {
         let request_id = self
             .instance
             .request_states

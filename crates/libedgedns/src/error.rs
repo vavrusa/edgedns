@@ -5,6 +5,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 use std::net;
+use std::num;
 use std::result;
 use tokio::timer;
 use native_tls;
@@ -72,6 +73,12 @@ impl From<io::ErrorKind> for Error {
 impl From<net::AddrParseError> for Error {
     fn from(e: net::AddrParseError) -> Error {
         Error::Io(io::Error::new(io::ErrorKind::AddrNotAvailable, e.description()))
+    }
+}
+
+impl From<num::ParseIntError> for Error {
+    fn from(e: num::ParseIntError) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e.description()))
     }
 }
 

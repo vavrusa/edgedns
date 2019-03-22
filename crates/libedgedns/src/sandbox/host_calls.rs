@@ -1,5 +1,5 @@
 use super::{from_context, GuestCallback, HostFuture};
-use crate::{forwarder, Scope};
+use crate::{forwarder, ClientRequest};
 use bytes::{BufMut, BytesMut};
 use guest_types as guest;
 use log::*;
@@ -219,7 +219,7 @@ extern "C" fn forward_create(
         // Forward message from guest memory
         let msg = &memory[msg_ptr as usize..(msg_ptr + msg_len) as usize];
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let local_scope = Scope::new(msg.into(), local_addr).expect("scope");
+        let local_scope = ClientRequest::new(msg.into(), local_addr).expect("scope");
         (msg.into(), local_scope)
     };
 

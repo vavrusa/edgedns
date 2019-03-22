@@ -5,7 +5,6 @@
 
 use crate::error::{Error, Result};
 use crate::forwarder::LoadBalancingMode;
-use url::Url;
 use log::*;
 use native_tls::{Identity, TlsAcceptor};
 use std::convert::TryFrom;
@@ -17,6 +16,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use toml;
+use url::Url;
 
 /// EdgeDNS server type definition.
 /// The server can operate in either forwarder mode, or fully recursive mode.
@@ -51,6 +51,7 @@ impl FromStr for ServerType {
 pub struct Listener {
     pub address: SocketAddr,
     pub tls: Option<TlsAcceptor>,
+    pub proxy_protocol: bool,
     pub internal: bool,
 }
 
@@ -59,11 +60,18 @@ impl Listener {
         Self {
             address,
             tls: None,
+            proxy_protocol: false,
             internal: false,
         }
     }
 
-    fn set_tls(&mut self, config: &toml::Value) -> Result<()> {
+    fn with_config(&mut self, config: &toml::Value) -> Result<()> {
+        // Enable proxy protocol (https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) on this listener.
+        if let Some(val) = config.get("proxy_protocol") {
+            self.proxy_protocol = val.as_bool().unwrap_or(false);
+        }
+
+        // Enable TLS with given certificate bundle on this listener.
         if let Some(tls) = config.get("tls") {
             // Only pkcs12 certificate is supported currently
             let cert = match tls.as_array() {
@@ -284,9 +292,9 @@ impl Config {
                                 )
                                 .expect("network.listen.address is a valid address");
 
-                                // Optional TLS configuration
+                                // Optional configuration
                                 listener
-                                    .set_tls(opts)
+                                    .with_config(opts)
                                     .expect("network.listen.tls configuration");
 
                                 // Marking for internal interfaces

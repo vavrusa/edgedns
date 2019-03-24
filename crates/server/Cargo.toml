@@ -7,7 +7,7 @@ edition = "2018"
 
 [features]
 jemalloc = ["jemallocator"]
-webservice = ["hyper"]
+webservice = ["hyper", "url", "base64"]
 default = ["jemalloc", "webservice"]
 
 [[bin]]
@@ -32,3 +32,5 @@ stream-cancel = "0.4"
 tokio = {version = "0.1.16", features=["async-await-preview"]}
 tokio-signal = "0.2"
 listenfd = "0.3"
+url = {version = "1.7", optional = true}
+base64 = {version = "0.10", optional = true}

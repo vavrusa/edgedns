@@ -129,7 +129,7 @@ fn main() {
             // Start the optional webservice
             if !bound.contains_key(&context.config.webservice_listen_addr) {
                 #[cfg(feature = "webservice")]
-                match webservice::WebService::spawn(context.clone(), cancel.clone()) {
+                match webservice::WebService::spawn(context.clone(), query_router, cancel.clone()) {
                     Err(e) => panic!("failed to spawn webservice: {}", e),
                     Ok(_) => {}
                 }
@@ -169,7 +169,7 @@ fn take_listener(
                 // Check if the listener matches the webservice
                 if local_addr == config.webservice_listen_addr {
                     #[cfg(feature = "webservice")]
-                    match webservice::WebService::spawn_listener(context.clone(), socket, cancel) {
+                    match webservice::WebService::spawn_listener(context.clone(), router.clone(), socket, cancel) {
                         Err(e) => {
                             warn!("failed to spawn webservice: {}", e);
                             return Err(Error::new(ErrorKind::Other, e.to_string()));

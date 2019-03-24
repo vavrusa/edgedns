@@ -9,7 +9,7 @@ mod codecs;
 mod conductor;
 mod config;
 mod context;
-mod error;
+pub mod error;
 pub mod forwarder;
 mod query_router;
 pub mod recursor;

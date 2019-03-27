@@ -7,7 +7,7 @@ use crate::recursor::Recursor;
 use crate::sandbox::Sandbox;
 use crate::tracing;
 use crate::varz;
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, BufMut};
 use domain_core::bits::*;
 use domain_core::iana::{Class, Rcode, Rtype};
 use domain_core::rdata::{AllRecordData, Txt};
@@ -399,11 +399,15 @@ impl QueryRouter {
 
         // Build message response header and question
         let mut message = {
+            let server_type = self.context.config.server_type;
             let mut message = MessageBuilder::from_buf(answer);
             let header = message.header_mut();
             *header = *scope.query.header();
             header.set_id(scope.query.header().id());
             header.set_qr(true);
+            header.set_ra(server_type == ServerType::Recursive);
+            header.set_aa(false);
+            header.set_ad(false);
             if message.push(scope.question.clone()).is_err() {
                 return Err(ErrorKind::UnexpectedEof.into());
             }
@@ -417,13 +421,19 @@ impl QueryRouter {
             match qname {
                 b"\x02id\x06server\x00" => {
                     if let Some(identity) = &config.identity {
-                        let rdata = Txt::new(identity.parse().unwrap());
+                        let mut data = BytesMut::with_capacity(identity.len() + 1);
+                        data.put(identity.len() as u8);
+                        data.put(identity);
+                        let rdata = Txt::new(CharStr::from_bytes(data.freeze()).unwrap());
                         drop(message.push((owner, Class::Ch, 0, rdata)));
                     }
                 }
                 b"\x07version\x06server\x00" => {
                     if let Some(version) = &config.version {
-                        let rdata = Txt::new(version.parse().unwrap());
+                        let mut data = BytesMut::with_capacity(version.len() + 1);
+                        data.put(version.len() as u8);
+                        data.put(version);
+                        let rdata = Txt::new(CharStr::from_bytes(data.freeze()).unwrap());
                         drop(message.push((owner, Class::Ch, 0, rdata)));
                     }
                 }

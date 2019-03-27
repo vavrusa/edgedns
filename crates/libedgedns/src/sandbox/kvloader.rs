@@ -64,7 +64,7 @@ impl KVLoader {
         let signing_key = uri
             .query_pairs()
             .find(|(k, _)| k == "signing_key")
-            .and_then(|(_, v)| base64::decode(v.as_bytes()).ok())
+            .and_then(|(_, v)| base64::decode_config(v.as_bytes(), base64::URL_SAFE).ok())
             .map(|x| hmac::SigningKey::new(&digest::SHA256, &x));
 
         // Warn user as the binaries from the KV will be implicitly trusted

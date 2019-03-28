@@ -5,7 +5,6 @@ use guest_types as guest;
 use log::*;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixStream;
 use tokio::prelude::*;
@@ -452,11 +451,35 @@ extern "C" fn local_socket_open(ptr: i32, len: i32, ctx: &mut Ctx) -> i32 {
     let slice = &memory[ptr as usize..(ptr + len) as usize];
 
     // Parse path from the guest
-    // TODO: ensure it's in preconfigured chroot
     let path = match std::str::from_utf8(slice) {
-        Ok(path) => Path::new(path).to_path_buf(),
+        Ok(path) => match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(_) => return guest::Error::InvalidInput.into(),
+        },
         Err(_) => return guest::Error::InvalidInput.into(),
     };
+
+    // Check if the module is permitted to access path
+    if let Some(Some(Some(ref paths))) = instance
+        .config()
+        .map(|c| c.get("path_allowed").map(|p| p.as_array()))
+    {
+        let is_allowed = paths
+            .iter()
+            .filter_map(|x| x.as_str())
+            .any(|x| path.starts_with(x));
+        if !is_allowed {
+            trace!("[{}] local stream {:?}, not permitted", instance, path);
+            return guest::Error::PermissionDenied.into();
+        }
+    } else {
+        trace!(
+            "[{}] local stream {:?}, not permitted to open any path",
+            instance,
+            path
+        );
+        return guest::Error::PermissionDenied.into();
+    }
 
     // Check if the local file exists
     if !path.exists() {

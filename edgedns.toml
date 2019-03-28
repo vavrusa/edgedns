@@ -62,14 +62,6 @@ listen = "0.0.0.0:9090"
 # Directory to chroot() into
 # chroot = "/var/empty"
 
-# Number of threads handling client queries received over UDP
-# More than 1 is rarely required. Set to 0 to disable UDP.
-threads_udp = 1
-
-# Number of threads handling client queries received over TCP
-# More than 1 is very rarely required. Set to 0 to disable TCP.
-threads_tcp = 1
-
 # Max number of clients using TCP
 max_tcp_clients = 100
 
@@ -121,3 +113,5 @@ only_failures = false
 
 # Enabled app and its configuration.
 #[apps.example]
+# Whitelist of FS paths accessible to the apps.
+#path_allow = [ '/tmp/memcache.sock' ]

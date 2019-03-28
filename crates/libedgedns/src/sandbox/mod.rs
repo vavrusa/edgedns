@@ -1,4 +1,4 @@
-use crate::{Context, ClientRequest};
+use crate::{ClientRequest, Context};
 use bytes::BytesMut;
 use core::ffi::c_void;
 use domain_core::bits::Message;
@@ -16,12 +16,13 @@ use std::sync::Arc;
 use tokio::net::UnixStream;
 use tokio::prelude::*;
 use tokio::timer;
+use toml;
 
 // Re-export environment instantiation.
 use wasmer_runtime::{error, Ctx, Value};
 mod fsloader;
-mod kvloader;
 mod host_calls;
+mod kvloader;
 mod sandbox;
 pub use sandbox::Sandbox;
 
@@ -188,6 +189,14 @@ impl InstanceWrapper {
 
     pub fn cancel(&self) {
         drop(self.cancel.0.lock().take());
+    }
+
+    /// Returns the configuration for current instance.
+    pub fn config(&self) -> Option<&toml::value::Table> {
+        match self.context.config.apps_config.get(&self.name) {
+            Some(t) => t.as_table(),
+            None => None,
+        }
     }
 
     fn create_task(&self) -> usize {

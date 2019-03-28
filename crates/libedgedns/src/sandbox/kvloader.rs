@@ -154,9 +154,11 @@ impl KVLoader {
                     error!("failed to verify signature for app {}: {}", key, e);
                     continue;
                 }
+
             }
 
-            replace_instance(key, &data, now, signature, &instances, context.clone())?;
+            let name = &key[self.prefix.len() + "/apps/".len()..];
+            replace_instance(name.to_owned(), &data, now, signature, &instances, context.clone())?;
         }
 
         // Mark all apps to sweep the removed ones after reading the manifest
@@ -190,7 +192,7 @@ mod test {
     fn mock_manifest() -> String {
         let key = hmac::SigningKey::new(&digest::SHA256, SIGNING_KEY);
         let signature = hmac::sign(&key, &TEST_APP);
-        format!("/apps/test:{}", base64::encode(&signature))
+        format!("test:/apps/test,{}", base64::encode(&signature))
     }
 
     // Start a mock KV serving the test app
@@ -208,12 +210,12 @@ mod test {
                     let (sink, stream) = Framed::new(socket, LinesCodec::new()).split();
                     stream
                         .map(move |line| {
-                            if line.contains("get /manifest") {
+                            if line.contains("get test:/manifest") {
                                 let x = mock_manifest();
-                                format!("VALUE /manifest 0 {}\r\n{}\r\n", x.len(), x)
-                            } else if line.contains("get /apps/test") {
+                                format!("VALUE test:/manifest 0 {}\r\n{}\r\n", x.len(), x)
+                            } else if line.contains("get test:/apps/test") {
                                 let x = base64::encode(TEST_APP);
-                                format!("VALUE /manifest 0 {}\r\n{}\r\n", x.len(), x)
+                                format!("VALUE test:/apps/test 0 {}\r\n{}\r\n", x.len(), x)
                             } else {
                                 format!("END\r\n")
                             }
@@ -239,19 +241,19 @@ mod test {
 
                 // Create a loader with bad signing key
                 let url = format!(
-                    "memcache://{}?signing_key={}",
+                    "memcache://{}?prefix=test:&signing_key={}",
                     addr,
                     base64::encode(b"badkey")
                 )
                 .parse()
                 .expect("url");
                 let loader = KVLoader::new(url, toml::value::Table::new());
-                await!(loader.load(&instances, &context)).expect("load works");
+                await!(loader.load(&instances, &context)).unwrap();
                 assert_eq!(instances.read().len(), 0);
 
                 // Create a loader with good signing key
                 let url = format!(
-                    "memcache://{}?signing_key={}",
+                    "memcache://{}?prefix=test:&signing_key={}",
                     addr,
                     base64::encode(SIGNING_KEY)
                 )
@@ -264,7 +266,7 @@ mod test {
                 assert_eq!(instances.read().len(), 1);
                 assert_eq!(
                     instances.read().iter().next().map(|(x, _)| x.to_owned()),
-                    Some("/apps/test".to_owned())
+                    Some("test".to_owned())
                 );
                 drop(cancel)
             },
